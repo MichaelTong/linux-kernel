@@ -297,7 +297,7 @@ static void md_make_request(struct request_queue *q, struct bio *bio)
         part_stat_inc(cpu, &mddev->gendisk->part0, ios[rw]);
         part_stat_add(cpu, &mddev->gendisk->part0, sectors[rw], sectors);
         part_stat_unlock();
-	}
+    }
 
 	if (atomic_dec_and_test(&mddev->active_io) && mddev->suspended){
 		wake_up(&mddev->sb_wait);

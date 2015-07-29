@@ -5051,6 +5051,7 @@ static void raid5_parity_endio(struct bio *bi, int error)
     struct md_rdev *rdev;
 
     bio_put(bi);
+
     rdev = (void *)raid_bi->bi_next;
     raid_bi->bi_next = NULL;
     mddev = rdev->mddev;
@@ -5650,14 +5651,15 @@ static int read_parity(struct mddev *mddev, struct bio *raid_bi)
             rdev = NULL;
         }
     }
-    if (rdev)
-        atomic_inc(&rdev->nr_pending);
-    rcu_read_unlock();
 
     if(rdev)
     {
         sector_t first_bad;
         int bad_sectors;
+
+        atomic_inc(&rdev->nr_pending);
+        rcu_read_unlock();
+
         printk("MikeT: %s %s %d\n",__FILE__, __func__, __LINE__);
 		raid_bi->bi_next = (void*)rdev;
 		align_bi->bi_bdev = rdev->bdev;
@@ -5672,24 +5674,24 @@ static int read_parity(struct mddev *mddev, struct bio *raid_bi)
                             &first_bad, &bad_sectors))
         {
             /* too big in some way, or has a known bad block*/
-            //bio_put(align_bi);
+            bio_put(align_bi);
             rdev_dec_pending(rdev, mddev);
             return 0;
         }
         //printk("MikeT: %s %s %d, bio flags %lx\n", __FILE__, __func__, __LINE__, raid_bi->bi_flags);
         align_bi->bi_iter.bi_sector += rdev->data_offset;
-/*
+
         spin_lock_irq(&conf->device_lock);
         wait_event_lock_irq(conf->wait_for_stripe,
                             conf->quiesce ==0,
                             conf->device_lock);
 		atomic_inc(&conf->active_aligned_reads);
         spin_unlock_irq(&conf->device_lock);
-*/
-        if(mddev->gendisk)
-            trace_block_bio_remap(bdev_get_queue(align_bi->bi_bdev),
-                                  align_bi, disk_devt(mddev->gendisk),
-                                  raid_bi->bi_iter.bi_sector);
+
+        //if(mddev->gendisk)
+        //    trace_block_bio_remap(bdev_get_queue(align_bi->bi_bdev),
+        //                          align_bi, disk_devt(mddev->gendisk),
+        //                          raid_bi->bi_iter.bi_sector);
         //printk("MikeT: %s %s %d, bio flags %lx\n", __FILE__, __func__, __LINE__, raid_bi->bi_flags);
         /*printk("MikeT: %s %s %d, "
                "bio %p, bi_next %p, bi_bdev %p, bi_flags %lx, bi_rw %lx; "
@@ -5707,6 +5709,8 @@ static int read_parity(struct mddev *mddev, struct bio *raid_bi)
     }
     else
     {
+        rcu_read_unlock();
+        bio_put(align_bi);
         return 0;
     }
 }

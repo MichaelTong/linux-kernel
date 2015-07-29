@@ -675,6 +675,7 @@ static int dio_alloc_percpu_all(struct compute_percpu *percpu)
         {
             pr_err("%s, failed memory allocation for cpu %ld\n", __func__, cpu);
         }
+        printk("MikeT: %s %s %d, cpu %lu, scribble: %p\n ", __FILE__, __func__, __LINE__, cpu, per->scribble);
     }
     put_online_cpus();
 
@@ -740,21 +741,20 @@ static void dio_bio_do_compute5(struct dio *dio, struct page *parity, int target
     int i,count=0;
     char *tmp=kmalloc(4096, GFP_KERNEL);
 
-    //struct compute_percpu __percpu *percpu=NULL, *pc=NULL;
-	//int ret;
-	//unsigned long cpu;
+    struct compute_percpu __percpu *percpu=NULL, *pc=NULL;
+	int ret;
+	unsigned long cpu;
 
     printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
-/*
+
     if((ret = dio_alloc_percpu_all(percpu))!=0)
     {
         printk("MikeT: %s %s %d, can't alloc percpu: %d\n", __FILE__, __func__, __LINE__, ret);
-        kfree(tmp);
-        put_cpu();
-        return;
     }
     cpu = get_cpu();
-    pc = per_cpu_ptr(percpu, cpu);*/
+    pc = per_cpu_ptr(percpu, cpu);
+
+    printk("MikeT: %s %s %d, cpu %lu, pc %p\n", __FILE__, __func__, __LINE__, cpu, pc);
     printk("MikeT: %s %s %d, dio %p\n", __FILE__, __func__, __LINE__, dio);
     xor_srcs = kmalloc(sizeof(struct page *) * (4+2) + sizeof(addr_conv_t)*(4+2), GFP_KERNEL);//pc->scribble;
     printk("MikeT: %s %s %d, srcs: %p\n", __FILE__, __func__, __LINE__, xor_srcs);
@@ -769,8 +769,9 @@ static void dio_bio_do_compute5(struct dio *dio, struct page *parity, int target
     printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
     submit.scribble = (struct addr_conv_t*)(xor_srcs + sizeof(struct page *) *(4+2));
     do_sync_xor(xor_dest, xor_srcs, 0, count, PAGE_SIZE, &submit);
-    //put_cpu();
-    //dio_free_percpu_all(percpu);
+
+    put_cpu();
+    dio_free_percpu_all(percpu);
 
     printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
     printk("MikeT: %s %s %d, data: %s\n", __FILE__, __func__, __LINE__, (char *)page_address(xor_dest));
@@ -861,7 +862,7 @@ static void dio_await_completion_parity_MikeT(struct dio *dio)
                 break;
             }
             else
-                bio_put(bio);
+                dio_bio_complete(dio, bio);
         }
     }while(bio);
 
@@ -1570,7 +1571,7 @@ static inline int send_RAID_bio_MikeT(struct dio *dio, struct dio_submit *sdio, 
                */
     printk("MikeT: %s %s %d, get page: %p\n", __FILE__, __func__, __LINE__,page);
     bio = bio_kmalloc(GFP_KERNEL, 1);
-    bio_reset(bio);
+    //bio_reset(bio);
     bio->bi_bdev = rbio->bi_bdev;
     //bio->bi_flags = rbio->bi_flags;
     bio->bi_rw = READ;
@@ -1584,10 +1585,11 @@ static inline int send_RAID_bio_MikeT(struct dio *dio, struct dio_submit *sdio, 
     bio->bi_end_io = dio_bio_end_pio;
     bio->need_parity = true;
 
+    //bio_add_page(bio, page, PAGE_SIZE, 0);
     bio->bi_io_vec[0].bv_page = page;
     bio->bi_io_vec[0].bv_len = PAGE_SIZE;
     bio->bi_io_vec[0].bv_offset = 0;
-   // bio->bi_phys_segments++;
+    //bio->bi_phys_segments++;
     bio->bi_vcnt++;
 
     //bvec = &rbio->bi_io_vec[rbio->bi_vcnt];
