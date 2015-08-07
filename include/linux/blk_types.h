@@ -46,8 +46,8 @@ struct bvec_iter {
 struct bio {
 	struct bio		*bi_next;	/* request queue link */
 	struct block_device	*bi_bdev;
-	bool dio_comp;
-	bool need_parity;
+	//bool dio_comp;
+	//bool need_parity;
 	unsigned long		bi_flags;	/* status, command, etc */
 	unsigned long		bi_rw;		/* bottom bits READ/WRITE,
 						 * top bits priority
@@ -123,7 +123,9 @@ struct bio {
 #define BIO_EOPNOTSUPP	7	/* not supported */
 #define BIO_NULL_MAPPED 8	/* contains invalid user pages */
 #define BIO_QUIET	9	/* Make BIO Quiet */
-#define BIO_SNAP_STABLE	10	/* bio data must be snapshotted during write */
+#define BIO_SNAP_STABLE	10	/* bio data must be snapshotted during write */+
+#define BIO_DIO_COMPLETE 11
+#define BIO_NEED_PARITY 12
 
 /*
  * Flags starting here get preserved by bio_reset() - this includes

@@ -265,7 +265,7 @@ static void return_io(struct bio *return_bi)
 
         //bio_endio(bi, 0);
 
-        if(bi->dio_comp)
+        if(test_bit(BIO_DIO_COMPLETE, &bi->bi_flags))
         {
             printk("MikeT: %s %s %d, dio already completed\n", __FILE__, __func__, __LINE__);
             if(ignoreR)
@@ -5086,8 +5086,8 @@ static void raid5_align_endio(struct bio *bi, int error)
     struct r5conf *conf;
     int uptodate = test_bit(BIO_UPTODATE, &bi->bi_flags);
     struct md_rdev *rdev;
-    struct bio_vec *bvec;
-	unsigned i;
+    //struct bio_vec *bvec;
+	//unsigned i;
 
     bio_put(bi);
 
@@ -5103,7 +5103,7 @@ static void raid5_align_endio(struct bio *bi, int error)
         //MikeT-star-read
         printk("MikeT: %s %s %d, no error and uptodate, uptodate %d,sectoraddr %llu, sectorsize %d, deviceaddr %p\n", __FILE__,__func__, __LINE__,uptodate,(unsigned long long)raid_bi->bi_iter.bi_sector,raid_bi->bi_iter.bi_size, raid_bi->bi_bdev);
 
-        if(raid_bi->dio_comp)
+        if(test_bit(BIO_DIO_COMPLETE, &raid_bi->bi_flags))
         {
             printk("MikeT: %s %s %d, dio already completed\n", __FILE__, __func__, __LINE__);
             //bio_for_each_segment_all(bvec, raid_bi, i) {
@@ -5113,7 +5113,7 @@ static void raid5_align_endio(struct bio *bi, int error)
             //        set_page_dirty_lock(page);
             //    page_cache_release(page);
 			//}
-            bio_put(raid_bi);
+			bio_endio(raid_bi, 0);
         }
         else
         {
@@ -5279,7 +5279,7 @@ static int chunk_aligned_read(struct mddev *mddev, struct bio * raid_bio)
                align_bi->bi_iter.bi_sector, align_bi->bi_iter.bi_size, align_bi->bi_iter.bi_idx, align_bi->bi_iter.bi_bvec_done,
                align_bi->bi_phys_segments, align_bi->bi_seg_front_size, align_bi->bi_seg_back_size, atomic_read(&align_bi->bi_remaining),
                align_bi->bi_vcnt, align_bi->bi_max_vecs, atomic_read(&align_bi->bi_cnt), align_bi->bi_io_vec, align_bi->bi_pool );*/
-        if(!raid_bio->dio_comp)
+        if(!test_bit(BIO_DIO_COMPLETE, &raid_bio->bi_flags))
             generic_make_request(align_bi);
         else
             bio_endio(align_bi, 0);
@@ -5740,7 +5740,7 @@ static void make_request(struct mddev *mddev, struct bio * bi)
 
     printk("MikeT: %s %s %d, after md_write_start\n", __FILE__,__func__, __LINE__);
 
-    if(bi->need_parity)
+    if(test_bit(BIO_NEED_PARITY, &bi->bi_flags))
     {
         printk("MikeT: %s %s %d, read parity..\n", __FILE__, __func__, __LINE__);
         read_parity(mddev, bi);

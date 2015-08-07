@@ -291,7 +291,7 @@ static void md_make_request(struct request_queue *q, struct bio *bio)
 	sectors = bio_sectors(bio);
 	mddev->pers->make_request(mddev, bio);
 
-    if(!bio->need_parity)
+    if(!test_bit(BIO_NEED_PARITY, &bio->bi_flags))
     {
         cpu = part_stat_lock();
         part_stat_inc(cpu, &mddev->gendisk->part0, ios[rw]);

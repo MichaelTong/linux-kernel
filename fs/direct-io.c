@@ -56,10 +56,6 @@
 extern int ignoreR;
 extern int reconRead;
 
-struct compute_percpu{
-    struct page *spare_page;
-    struct flex_array *scribble;
-};
 /*
  * This code generally works in units of "dio_blocks".  A dio_block is
  * somewhere between the hard sector size and the filesystem block size.  it
@@ -357,6 +353,11 @@ static void dio_bio_end_io(struct bio *bio, int error)
 {
 	struct dio *dio = bio->bi_private;
 	unsigned long flags;
+	if(!dio)
+    {
+        bio_put(bio);
+        return;
+    }
 
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
@@ -365,7 +366,7 @@ static void dio_bio_end_io(struct bio *bio, int error)
 		wake_up_process(dio->waiter);
 	spin_unlock_irqrestore(&dio->bio_lock, flags);
 
-    bio->dio_comp=true;
+    bio->bi_flags |= 1 << BIO_DIO_COMPLETE;
 }
 
 static void dio_bio_end_pio(struct bio *bio, int error)
@@ -374,6 +375,8 @@ static void dio_bio_end_pio(struct bio *bio, int error)
     unsigned long flags;
 
     printk("MikeT: %s %s %d, parity bio end.%s\n", __FILE__, __func__, __LINE__, (char *)bio_data(bio));
+    if(!dio)
+        return;
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
 	dio->bio_list = bio;
@@ -613,6 +616,8 @@ static int dio_bio_complete_MikeT(struct dio *dio, struct bio *bio)
 	}
 	return uptodate ? 0 : -EIO;
 }
+
+/*
 static int dio_alloc_percpu(struct compute_percpu *percpu, unsigned long cpu)
 {
     int err=0;
@@ -702,6 +707,7 @@ static void dio_free_percpu_all(struct compute_percpu *percpu)
     put_online_cpus();
     free_percpu(percpu);
 }
+
 static void do_sync_xor(struct page *dest, struct page **src_list, unsigned int offset,
                         int src_cnt, size_t len, struct async_submit_ctl *submit)
 {
@@ -733,33 +739,60 @@ static void do_sync_xor(struct page *dest, struct page **src_list, unsigned int 
         src_off += xor_src_cnt;
     }
 }
-static void dio_bio_do_compute5(struct dio *dio, struct page *parity, int target)
+*/
+static addr_conv_t *to_addr_conv(struct r5conf *conf,
+                                 struct raid5_percpu *percpu)
 {
-    struct page **xor_srcs;
+    return percpu->scribble + sizeof(struct page *) * (conf->raid_disks + 2);
+}
+static void dio_bio_end_compute(void *bio_reference)
+{
+    struct bio *bio = bio_reference;
+    struct dio *dio = bio->bi_private;
+	unsigned long flags;
+
+
+    printk("MikeT: %s %s %d, bio: %p, dio: %p\n", __FILE__, __func__, __LINE__, bio, dio);
+	if(!dio)
+    {
+        kfree(bio_data(bio));
+        bio_put(bio);
+        return;
+    }
+    //struct dio *dio = bio->bi_private;
+	spin_lock_irqsave(&dio->bio_lock, flags);
+	bio->bi_private = dio->bio_list;
+	dio->bio_list = bio;
+	//if (--dio->refcount == 1 + ignoreR && dio->waiter)
+	//	wake_up_process(dio->waiter);
+	spin_unlock_irqrestore(&dio->bio_lock, flags);
+
+}
+static void dio_bio_do_compute5(struct dio *dio, struct bio *bio, int target, struct r5conf *conf, struct raid5_percpu *percpu)
+{
+    struct page *parity = bio_page(bio);
+    struct page **xor_srcs = percpu->scribble;
     struct page *xor_dest;
+    //struct dma_async_tx_descriptor *tx=NULL;
     struct async_submit_ctl submit;
     int i,count=0;
-    char *tmp=kmalloc(4096, GFP_KERNEL);
-
-    struct compute_percpu __percpu *percpu=NULL, *pc=NULL;
-	int ret;
-	unsigned long cpu;
+    //char *tmp=kmalloc(PAGE_SIZE, GFP_KERNEL);
 
     printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+    bio->bi_private = dio;
+    //if((ret = dio_alloc_percpu_all(percpu))!=0)
+    //{
+    //    printk("MikeT: %s %s %d, can't alloc percpu: %d\n", __FILE__, __func__, __LINE__, ret);
+    //}
+    //cpu = get_cpu();
+    //pc = per_cpu_ptr(percpu, cpu);
 
-    if((ret = dio_alloc_percpu_all(percpu))!=0)
-    {
-        printk("MikeT: %s %s %d, can't alloc percpu: %d\n", __FILE__, __func__, __LINE__, ret);
-    }
-    cpu = get_cpu();
-    pc = per_cpu_ptr(percpu, cpu);
-
-    printk("MikeT: %s %s %d, cpu %lu, pc %p\n", __FILE__, __func__, __LINE__, cpu, pc);
+    printk("MikeT: %s %s %d, percpu %p, scribble %p\n", __FILE__, __func__, __LINE__, percpu, percpu->scribble);
     printk("MikeT: %s %s %d, dio %p\n", __FILE__, __func__, __LINE__, dio);
-    xor_srcs = kmalloc(sizeof(struct page *) * (4+2) + sizeof(addr_conv_t)*(4+2), GFP_KERNEL);//pc->scribble;
+    //xor_srcs = kmalloc(sizeof(struct page *) * (4+2) + sizeof(addr_conv_t)*(4+2), GFP_KERNEL);//pc->scribble;
     printk("MikeT: %s %s %d, srcs: %p\n", __FILE__, __func__, __LINE__, xor_srcs);
 
-    xor_dest = virt_to_page(tmp);
+    xor_dest = dio->pages[target];
     xor_srcs[count++]=parity;
     for(i=0;i<3;i++)
     {
@@ -767,35 +800,51 @@ static void dio_bio_do_compute5(struct dio *dio, struct page *parity, int target
             xor_srcs[count++]=dio->pages[i];
     }
     printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
-    submit.scribble = (struct addr_conv_t*)(xor_srcs + sizeof(struct page *) *(4+2));
-    do_sync_xor(xor_dest, xor_srcs, 0, count, PAGE_SIZE, &submit);
+    init_async_submit(&submit, ASYNC_TX_FENCE|ASYNC_TX_XOR_ZERO_DST, NULL,
+                      dio_bio_end_compute, bio, to_addr_conv(conf, percpu));
 
-    put_cpu();
-    dio_free_percpu_all(percpu);
+   // submit.scribble = (struct addr_conv_t*)(xor_srcs + sizeof(struct page *) *(4+2));
+    //do_sync_xor(xor_dest, xor_srcs, 0, count, PAGE_SIZE, &submit);
+
+   // put_cpu();
+   // dio_free_percpu_all(percpu);
 
     printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
-    printk("MikeT: %s %s %d, data: %s\n", __FILE__, __func__, __LINE__, (char *)page_address(xor_dest));
-    memcpy(page_address(dio->pages[target]), tmp, PAGE_SIZE);
+
+    if (unlikely(count == 1))
+        async_memcpy(xor_dest, xor_srcs[0], 0, 0, PAGE_SIZE, &submit);
+    else
+        async_xor(xor_dest, xor_srcs, 0, count, PAGE_SIZE, &submit);
+
+    // printk("MikeT: %s %s %d, data: %s\n", __FILE__, __func__, __LINE__, (char *)page_address(xor_dest));
+    //memcpy(page_address(dio->pages[target]), tmp, PAGE_SIZE);
 
     //clean up
     //page_cache_release(xor_dest);
     //free_page(xor_dest);
-    if (!PageCompound(dio->pages[target]))
-        set_page_dirty_lock(dio->pages[target]);
-    page_cache_release(dio->pages[target]);
+    //if (!PageCompound(dio->pages[target]))
+    //    set_page_dirty_lock(dio->pages[target]);
+    //page_cache_release(dio->pages[target]);
 
-    xor_dest = NULL;
-    kfree(tmp);
-    kfree(xor_srcs);
-    xor_srcs = NULL;
+    //xor_dest = NULL;
+    //kfree(tmp);
+    //kfree(xor_srcs);
+    //xor_srcs = NULL;
+    return ;
 
 }
-
+static void dio_await_completion_compute_MikeT(struct dio *dio);
 
 
 static int dio_bio_complete_parity_MikeT(struct dio *dio, struct bio *bio)
 {
 	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+    if (!dio)
+    {
+        kfree(bio_data(bio));
+        bio_put(bio);
+        return 0;
+    }
 
 	if (!uptodate)
 		dio->io_error = -EIO;
@@ -813,14 +862,26 @@ static int dio_bio_complete_parity_MikeT(struct dio *dio, struct bio *bio)
             printk("MikeT: %s %s %d, Before put bio, i: %d\n", __FILE__, __func__, __LINE__, i);
 		}
 		bio_put(bio);*/
+		unsigned long cpu;
+		struct mddev *mddev = bdev_get_queue(bio->bi_bdev)->queuedata;
+		struct r5conf *conf = mddev->private;
+		struct raid5_percpu *r_percpu = conf->percpu;
+		struct raid5_percpu *percpu;
 		/***reconstruct***/
 		printk("MikeT: %s %s %d, will reconstruct\n", __FILE__, __func__, __LINE__);
 
-		dio_bio_do_compute5(dio, bio_page(bio), 1);
+		cpu = get_cpu();
+        percpu = per_cpu_ptr(r_percpu, cpu);
+
+		dio_bio_do_compute5(dio, bio, 1, conf, percpu);
+
+		put_cpu();
 		//page_cache_release(bio_page(bio));
-		kfree(bio_data(bio));
+		//kfree(bio_data(bio));
         //free_page(bio_page(bio));
-        bio_put(bio);
+        //bio_put(bio);
+        dio_await_completion_compute_MikeT(dio);
+        printk("MikeT: %s %s %d, after wait compute\n", __FILE__, __func__, __LINE__);
 
 	}
 	return uptodate ? 0 : -EIO;
@@ -843,7 +904,11 @@ static void dio_await_completion_MikeT(struct dio *dio)
 	while(head!=NULL)
     {
         next = head->next;
-        head->bio->dio_comp = !(head->bio->dio_comp);
+        if(test_bit(BIO_DIO_COMPLETE, &head->bio->bi_flags))
+            __clear_bit(BIO_DIO_COMPLETE, &head->bio->bi_flags);
+        else
+            head->bio->bi_flags |= 1 << BIO_DIO_COMPLETE;
+        //head->bio->dio_comp = !(head->bio->dio_comp);
         head = next;
     }
 }
@@ -856,7 +921,7 @@ static void dio_await_completion_parity_MikeT(struct dio *dio)
         if(bio)
         {
             printk("MikeT: %s %s %d, bio %p\n", __FILE__, __func__, __LINE__, bio);
-            if(bio->need_parity)
+            if(test_bit(BIO_NEED_PARITY, &bio->bi_flags))
             {
                 dio_bio_complete_parity_MikeT(dio, bio);
                 break;
@@ -867,6 +932,31 @@ static void dio_await_completion_parity_MikeT(struct dio *dio)
     }while(bio);
 
 }
+
+static void dio_await_completion_compute_MikeT(struct dio *dio)
+{
+    struct bio *bio;
+    printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+    do{
+        bio = dio_await_one(dio);
+        if(bio)
+        {
+            printk("MikeT: %s %s %d, bio %p\n", __FILE__, __func__, __LINE__, bio);
+            if(test_bit(BIO_NEED_PARITY, &bio->bi_flags)&&!test_bit(BIO_DIO_COMPLETE, &bio->bi_flags))
+            {
+                kfree(bio_data(bio));
+                bio_put(bio);
+            }
+            else
+            {
+                bio_put(bio);
+            }
+                break;
+        }
+    }while(bio);
+
+}
+
 static inline int drop_refcount(struct dio *dio)
 {
 	int ret2;
@@ -952,7 +1042,8 @@ static ssize_t dio_complete_MikeT(struct dio *dio, loff_t offset, ssize_t ret,
 	while(head!=NULL)
 	{
         next = head->next;
-        if(!head->bio->dio_comp)
+        if(!test_bit(BIO_DIO_COMPLETE, &head->bio->bi_flags))
+        //if(!head->bio->dio_comp)
             kfree(head);
         head = next;
 	}
@@ -1583,7 +1674,8 @@ static inline int send_RAID_bio_MikeT(struct dio *dio, struct dio_submit *sdio, 
     //bio->bi_seg_back_size = rbio->bi_seg_back_size;
     bio->bi_private = dio;
     bio->bi_end_io = dio_bio_end_pio;
-    bio->need_parity = true;
+    bio->bi_flags |= 1<< BIO_NEED_PARITY;
+    //bio->need_parity = true;
 
     //bio_add_page(bio, page, PAGE_SIZE, 0);
     bio->bi_io_vec[0].bv_page = page;
@@ -1883,7 +1975,7 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
         while(head!=NULL)
         {
             next = head->next;
-            if(head->bio->dio_comp)
+            if(test_bit(BIO_DIO_COMPLETE, &head->bio->bi_flags))
             {
                 rbio = head->bio;
                 break;
