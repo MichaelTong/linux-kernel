@@ -5101,7 +5101,7 @@ static void raid5_align_endio(struct bio *bi, int error)
     if (!error && uptodate)
     {
         //MikeT-star-read
-        printk("MikeT: %s %s %d, no error and uptodate, uptodate %d,sectoraddr %llu, sectorsize %d, deviceaddr %p\n", __FILE__,__func__, __LINE__,uptodate,(unsigned long long)raid_bi->bi_iter.bi_sector,raid_bi->bi_iter.bi_size, raid_bi->bi_bdev);
+        printk("MikeT: %s %s %d, bio %p, no error and uptodate, uptodate %d,sectoraddr %llu, sectorsize %d, deviceaddr %p\n", __FILE__,__func__, __LINE__,raid_bi,uptodate,(unsigned long long)raid_bi->bi_iter.bi_sector,raid_bi->bi_iter.bi_size, raid_bi->bi_bdev);
 
         if(test_bit(BIO_DIO_COMPLETE, &raid_bi->bi_flags))
         {

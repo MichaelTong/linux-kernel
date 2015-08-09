@@ -1,0 +1,1 @@
+sudo mdadm --create --verbose /dev/md0 --level=4 --chunk=4 --raid-devices=4 /dev/mapper/d0 /dev/mapper/d1 /dev/sdd /dev/sde

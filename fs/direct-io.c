@@ -44,6 +44,7 @@
 #include <../drivers/md/raid5.h>
 #include <../drivers/md/md.h>
 #include <linux/flex_array.h>
+#include <linux/delay.h>
 
 
 /*
@@ -355,6 +356,7 @@ static void dio_bio_end_io(struct bio *bio, int error)
 	unsigned long flags;
 	if(!dio)
     {
+        printk("MikeT: %s %s %d, no dio\n", __FILE__, __func__, __LINE__);
         bio_put(bio);
         return;
     }
@@ -374,9 +376,14 @@ static void dio_bio_end_pio(struct bio *bio, int error)
     struct dio *dio = bio->bi_private;
     unsigned long flags;
 
-    printk("MikeT: %s %s %d, parity bio end.%s\n", __FILE__, __func__, __LINE__, (char *)bio_data(bio));
+    printk("MikeT: %s %s %d, parity bio end.\n", __FILE__, __func__, __LINE__);
     if(!dio)
+    {
+        printk("MikeT: %s %s %d, no dio\n", __FILE__, __func__, __LINE__);
+        kfree(bio_data(bio));
+        bio_put(bio);
         return;
+    }
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
 	dio->bio_list = bio;
@@ -759,7 +766,9 @@ static void dio_bio_end_compute(void *bio_reference)
         bio_put(bio);
         return;
     }
+    //mdelay(50);
     //struct dio *dio = bio->bi_private;
+    printk("MikeT: %s %s %d, bio: %p\n", __FILE__, __func__, __LINE__, bio);
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
 	dio->bio_list = bio;
@@ -841,6 +850,7 @@ static int dio_bio_complete_parity_MikeT(struct dio *dio, struct bio *bio)
 	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
     if (!dio)
     {
+        printk("MikeT: %s %s %d, no dio\n", __FILE__, __func__, __LINE__);
         kfree(bio_data(bio));
         bio_put(bio);
         return 0;
@@ -880,6 +890,7 @@ static int dio_bio_complete_parity_MikeT(struct dio *dio, struct bio *bio)
 		//kfree(bio_data(bio));
         //free_page(bio_page(bio));
         //bio_put(bio);
+
         dio_await_completion_compute_MikeT(dio);
         printk("MikeT: %s %s %d, after wait compute\n", __FILE__, __func__, __LINE__);
 
@@ -893,11 +904,11 @@ static void dio_await_completion_MikeT(struct dio *dio)
 	struct bio_record *head,*next;
 
 	do {
-        if(dio->refcount == 1 + ignoreR)
-            break;
 		bio = dio_await_one(dio);
 		if (bio)
 			dio_bio_complete_MikeT(dio, bio);
+        if(dio->refcount == 1 + ignoreR)
+            break;
 	} while (bio);
 
     head = dio->bio_record;
@@ -927,7 +938,12 @@ static void dio_await_completion_parity_MikeT(struct dio *dio)
                 break;
             }
             else
+            {
                 dio_bio_complete(dio, bio);
+                if(test_bit(BIO_DIO_COMPLETE, &bio->bi_flags))
+                    break;
+            }
+
         }
     }while(bio);
 

@@ -1,0 +1,5 @@
+sudo ./connect-nbd 147 0
+sudo ./connect-nbd 148 1
+sudo ./connect-nbd 149 2
+sudo ./connect-nbd 150 3
+sudo mdadm --create --verbose /dev/md0 --level=4 --chunk=4 --raid-devices=4 /dev/nbd0 /dev/nbd1 /dev/nbd2 /dev/nbd3

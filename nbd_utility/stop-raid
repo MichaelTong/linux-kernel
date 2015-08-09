@@ -1,0 +1,2 @@
+mdadm --stop /dev/md0 
+mdadm --zero-superblock /dev/sdb /dev/sdc /dev/sdd
