@@ -766,6 +766,7 @@ static void dio_bio_end_compute(void *bio_reference)
         bio_put(bio);
         return;
     }
+    //msleep(50);
     //mdelay(50);
     //struct dio *dio = bio->bi_private;
     printk("MikeT: %s %s %d, bio: %p\n", __FILE__, __func__, __LINE__, bio);
