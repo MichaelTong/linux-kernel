@@ -166,7 +166,7 @@ static inline int raid5_bi_processed_stripes(struct bio *bio)
 static inline int raid5_dec_bi_active_stripes(struct bio *bio)
 {
     atomic_t *segments = (atomic_t *)&bio->bi_phys_segments;
-    printk("MikeT: raid5 dec bi active stripes\n");
+    printk("MikeT: %s %s %d, raid5 dec bi active stripes\n", __FILE__, __func__, __LINE__);
     return atomic_sub_return(1, segments) & 0xffff;
 }
 
@@ -332,6 +332,7 @@ static void raid5_wakeup_stripe_thread(struct stripe_head *sh)
 
     if (conf->worker_cnt_per_group == 0)
     {
+        printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
         md_wakeup_thread(conf->mddev->thread);
         return;
     }
@@ -369,7 +370,11 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh,
             list_add_tail(&sh->lru, &conf->delayed_list);
             if (atomic_read(&conf->preread_active_stripes)
                     < IO_THRESHOLD)
-                md_wakeup_thread(conf->mddev->thread);
+                    {
+                        printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
+                        md_wakeup_thread(conf->mddev->thread);
+                    }
+
         }
         else if (test_bit(STRIPE_BIT_DELAY, &sh->state) &&
                  sh->bm_seq - conf->seq_write > 0)
@@ -388,7 +393,9 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh,
                 return;
             }
         }
+        printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
         md_wakeup_thread(conf->mddev->thread);
+        printk("MikeT: %s %s %d, end do release stripe\n", __FILE__, __func__, __LINE__);
     }
     else
     {
@@ -396,7 +403,11 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh,
         if (test_and_clear_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
             if (atomic_dec_return(&conf->preread_active_stripes)
                     < IO_THRESHOLD)
-                md_wakeup_thread(conf->mddev->thread);
+                    {
+                        printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
+                        md_wakeup_thread(conf->mddev->thread);
+                    }
+
         atomic_dec(&conf->active_stripes);
         if (!test_bit(STRIPE_EXPANDING, &sh->state))
             list_add_tail(&sh->lru, temp_inactive_list);
@@ -458,7 +469,11 @@ static void release_inactive_stripe_list(struct r5conf *conf,
     {
         wake_up(&conf->wait_for_stripe);
         if (conf->retry_read_aligned)
+        {
+            printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
             md_wakeup_thread(conf->mddev->thread);
+        }
+
     }
 }
 
@@ -529,6 +544,7 @@ static void release_stripe(struct stripe_head *sh)
     if (wakeup)
     {
         printk("MikeT: %s %s %d rs3\n", __FILE__,__func__, __LINE__);
+        printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
         md_wakeup_thread(conf->mddev->thread);
     }
     printk("MikeT: %s %s %d rs4 \n", __FILE__,__func__, __LINE__);
@@ -584,6 +600,7 @@ static void release_stripe_MikeT(struct stripe_head *sh)
     if (wakeup)
     {
         printk("MikeT: %s %s %d, conf->released_stripes was empty, wake up\n", __FILE__,__func__, __LINE__);
+        printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
         md_wakeup_thread(conf->mddev->thread);
     }
     printk("MikeT:  %s %s %d, shaddr %p, release_stripe_MikeT all done\n",
@@ -3522,7 +3539,11 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
 
     if (test_and_clear_bit(STRIPE_FULL_WRITE, &sh->state))
         if (atomic_dec_and_test(&conf->pending_full_writes))
+        {
+            printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
             md_wakeup_thread(conf->mddev->thread);
+        }
+
 }
 
 static void
@@ -3795,7 +3816,11 @@ static void handle_stripe_clean_event(struct r5conf *conf,
 
     if (test_and_clear_bit(STRIPE_FULL_WRITE, &sh->state))
         if (atomic_dec_and_test(&conf->pending_full_writes))
+        {
+            printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
             md_wakeup_thread(conf->mddev->thread);
+        }
+
 }
 
 static void handle_stripe_dirtying(struct r5conf *conf,
@@ -4889,7 +4914,11 @@ finish:
         atomic_dec(&conf->preread_active_stripes);
         if (atomic_read(&conf->preread_active_stripes) <
                 IO_THRESHOLD)
-            md_wakeup_thread(conf->mddev->thread);
+                {
+                    printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
+                    md_wakeup_thread(conf->mddev->thread);
+                }
+
     }
 
     return_io(s.return_bi);
@@ -5015,6 +5044,7 @@ static void add_bio_to_retry(struct bio *bi,struct r5conf *conf)
     conf->retry_read_aligned_list = bi;
 
     spin_unlock_irqrestore(&conf->device_lock, flags);
+    printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->mddev->thread);
     md_wakeup_thread(conf->mddev->thread);
 }
 
@@ -5198,13 +5228,6 @@ static int chunk_aligned_read(struct mddev *mddev, struct bio * raid_bio)
         raid5_compute_sector(conf, raid_bio->bi_iter.bi_sector,
                              0, &dd_idx, NULL);
 
-    if(reconRead && !ignoreR)
-    {
-        if(dd_idx==1)
-            dd_idx = pd_idx;
-
-    }
-
     end_sector = bio_end_sector(align_bi);
     rcu_read_lock();
     rdev = rcu_dereference(conf->disks[dd_idx].replacement);
@@ -5269,7 +5292,7 @@ static int chunk_aligned_read(struct mddev *mddev, struct bio * raid_bio)
         //__FILE__,__func__, __LINE__, align_bi->bi_rw,(unsigned long long)align_bi->bi_iter.bi_sector,align_bi->bi_iter.bi_size, align_bi->bi_bdev, align_bi->bi_seg_front_size,align_bi->bi_seg_back_size,align_bi->bi_flags);
         //printk_request_fn_name(align_bi);
         //printk("MikeT: %s %s %d, bio flags %lx\n", __FILE__, __func__, __LINE__, align_bi->bi_flags);
-        /*printk("MikeT: %s %s %d, "
+        printk("MikeT: %s %s %d, "
                "bio %p, bi_next %p, bi_bdev %p, bi_flags %lx, bi_rw %lx; "
                "bi_iter: bi_sector %u, bi_size %u, bi_idx %u, bi_bvec_done %u; "
                "bi_phys_segments %u, bi_seg_front_size %u, bi_seg_back_size %u, bi_remaining %d; "
@@ -5278,7 +5301,7 @@ static int chunk_aligned_read(struct mddev *mddev, struct bio * raid_bio)
                align_bi, align_bi->bi_next, align_bi->bi_bdev, align_bi->bi_flags, align_bi->bi_rw,
                align_bi->bi_iter.bi_sector, align_bi->bi_iter.bi_size, align_bi->bi_iter.bi_idx, align_bi->bi_iter.bi_bvec_done,
                align_bi->bi_phys_segments, align_bi->bi_seg_front_size, align_bi->bi_seg_back_size, atomic_read(&align_bi->bi_remaining),
-               align_bi->bi_vcnt, align_bi->bi_max_vecs, atomic_read(&align_bi->bi_cnt), align_bi->bi_io_vec, align_bi->bi_pool );*/
+               align_bi->bi_vcnt, align_bi->bi_max_vecs, atomic_read(&align_bi->bi_cnt), align_bi->bi_io_vec, align_bi->bi_pool );
         if(!test_bit(BIO_DIO_COMPLETE, &raid_bio->bi_flags))
             generic_make_request(align_bi);
         else
@@ -5581,7 +5604,10 @@ again:
         bio_endio(bi, 0);
     }
 }
-
+/**
+ * MikeT:
+ * Get disk number from bio
+ */
 static int getDiskNrMikeT(struct mddev *mddev, struct bio *bi)
 {
     struct r5conf *conf = mddev->private;
@@ -5604,6 +5630,11 @@ static void printk_request_fn_name(struct bio *bi)
     printk("MikeT: %s %s %d, %s\n",__FILE__,__func__,__LINE__, name);
 }
 
+/**
+ * MikeT:
+ * Read parity function.
+ * It is similar to chunk_aligned_read. Except that we set the device to be parity disk.
+ */
 static int read_parity(struct mddev *mddev, struct bio *raid_bi)
 {
     struct r5conf *conf = mddev->private;
@@ -5740,7 +5771,7 @@ static void make_request(struct mddev *mddev, struct bio * bi)
 
     printk("MikeT: %s %s %d, after md_write_start\n", __FILE__,__func__, __LINE__);
 
-    if(test_bit(BIO_NEED_PARITY, &bi->bi_flags))
+    if(test_bit(BIO_NEED_PARITY, &bi->bi_flags))/**MikeT: check flag, read parity**/
     {
         printk("MikeT: %s %s %d, read parity..\n", __FILE__, __func__, __LINE__);
         read_parity(mddev, bi);
@@ -5908,6 +5939,7 @@ retry:
                  * and wait a while
                  */
                 printk("MikeT: %s %s %d, stripe expanding, before release_stripe-20\n", __FILE__,__func__, __LINE__);
+                printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, mddev->thread);
                 md_wakeup_thread(mddev->thread);
                 release_stripe(sh);
                 schedule();
@@ -6095,6 +6127,7 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr, int *sk
         mddev->curr_resync_completed = sector_nr;
         conf->reshape_checkpoint = jiffies;
         set_bit(MD_CHANGE_DEVS, &mddev->flags);
+        printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, mddev->thread);
         md_wakeup_thread(mddev->thread);
         wait_event(mddev->sb_wait, mddev->flags == 0 ||
                    test_bit(MD_RECOVERY_INTR, &mddev->recovery));
@@ -6202,6 +6235,7 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr, int *sk
         mddev->curr_resync_completed = sector_nr;
         conf->reshape_checkpoint = jiffies;
         set_bit(MD_CHANGE_DEVS, &mddev->flags);
+        printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, mddev->thread);
         md_wakeup_thread(mddev->thread);
         wait_event(mddev->sb_wait,
                    !test_bit(MD_CHANGE_DEVS, &mddev->flags)
@@ -7181,6 +7215,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
 
     sprintf(pers_name, "raid%d", mddev->new_level);
     conf->thread = md_register_thread(raid5d, mddev, pers_name);
+    printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->thread);
     if (!conf->thread)
     {
         printk(KERN_ERR
@@ -8306,6 +8341,7 @@ static int raid5_check_reshape(struct mddev *mddev)
             mddev->chunk_sectors = new_chunk;
         }
         set_bit(MD_CHANGE_DEVS, &mddev->flags);
+        printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, mddev->thread);
         md_wakeup_thread(mddev->thread);
     }
     return check_reshape(mddev);

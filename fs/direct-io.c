@@ -52,10 +52,27 @@
  * the size of a structure in the slab cache
  */
 #define DIO_PAGES	64
-
+#define STRIPE_SIZE		PAGE_SIZE
+#define STRIPE_SHIFT		(PAGE_SHIFT - 9)
+#define STRIPE_SECTORS		(STRIPE_SIZE>>9)
 
 extern int ignoreR;
 extern int reconRead;
+/** MikeT: stripe_head for dio */
+struct dio_stripe_head{
+    struct r5conf *conf; //RAID configuration
+    sector_t sector; // Starting sector
+    short pd_idx; // Parity disk
+    short qd_idx; // 2nd Parity disk in RAID6
+    short ddf_layout; // layout
+    atomic_t count; // shcount
+    int disks; // total disks for RAID
+    int cpu;
+    long unsigned bio_complete_bit; //bits indicating bio/page's completion
+    int target, target2; //targets for reconstruction.
+    struct bio **dev_bio; // bios for each disk
+    struct dio_stripe_head *next; // next pointer.
+};
 
 /*
  * This code generally works in units of "dio_blocks".  A dio_block is
@@ -117,14 +134,12 @@ struct dio_submit {
 	unsigned tail;			/* last valid page + 1 */
 	size_t from, to;
 };
-struct bio_record{
-    struct bio *bio;
-    struct bio_record *next;
-};
+
 /* dio_state communicated between submission path and end_io */
 struct dio {
 	int flags;			/* doesn't change */
 	int rw;
+	bool isRAID;
 	struct inode *inode;
 	loff_t i_size;			/* i_size when submitted */
 	dio_iodone_t *end_io;		/* IO completion function */
@@ -139,8 +154,9 @@ struct dio {
 	int io_error;			/* IO error in completion path */
 	unsigned long refcount;		/* direct_io_worker() and bios */
 	struct bio *bio_list;		/* singly linked via bi_private */
-	struct bio_record *bio_record;
-	struct bio_record *bio_record_tail;
+	struct dio_stripe_head *dio_sh_list;
+	struct dio_stripe_head *dio_sh;
+	int sh_count;
 	struct task_struct *waiter;	/* waiting task (NULL if none) */
 
 	/* AIO related stuff */
@@ -245,7 +261,6 @@ static ssize_t dio_complete(struct dio *dio, loff_t offset, ssize_t ret,
 		bool is_async)
 {
 	ssize_t transferred = 0;
-	struct bio_record *head, *next;
 
 	/*
 	 * AIO submission can race with bio completion to get here while
@@ -291,13 +306,6 @@ static ssize_t dio_complete(struct dio *dio, loff_t offset, ssize_t ret,
 		aio_complete(dio->iocb, ret, 0);
 	}
 
-    head = dio->bio_record;
-	while(head!=NULL)
-	{
-        next = head->next;
-        kfree(head);
-        head = next;
-	}
 
 	//printk("MikeT: %s %s %d, page: %08x, %08x, %08x\n", __FILE__, __func__, __LINE__, dio->pages[0], dio->pages[1], dio->pages[2]);
 
@@ -313,6 +321,116 @@ static void dio_aio_complete_work(struct work_struct *work)
 }
 
 static int dio_bio_complete(struct dio *dio, struct bio *bio);
+
+/**
+ * MikeT:
+ * get a corresponding stripe for the bio
+ */
+static struct dio_stripe_head *dio_bio_get_stripe(struct dio *dio, struct bio *bio)
+{
+    if(dio->isRAID)
+    {
+        int sh_index =  (bio)->bi_iter.bi_sector / ((dio->dio_sh[0].disks - 1) * STRIPE_SECTORS);
+        return &dio->dio_sh[sh_index];
+    }
+    return NULL;
+}
+/**
+ * MikeT:
+ * link bio to its stripe.
+ */
+static inline void dio_bio_add_to_stripe(struct dio *dio, struct bio *bio)
+{
+    if(dio->isRAID)
+    {
+        struct dio_stripe_head *dsh = dio_bio_get_stripe(dio, bio);
+        int disk_index = ( (bio)->bi_iter.bi_sector - dsh->sector) / STRIPE_SECTORS;
+        if(test_bit(BIO_NEED_PARITY, &bio->bi_flags))
+            dsh->dev_bio[dsh->disks-1] = bio;
+        else
+        {
+            dsh->dev_bio[disk_index] = bio;
+            atomic_inc(&dsh->count);
+        }
+
+            //printk("MikeT: %s %s %d, sh_index: %d, %lx sector: %lx, disks: %d, shcount: %d, bio_complete: %lx\n",
+            //        __FILE__, __func__, __LINE__, sh_index, (bio)->bi_iter.bi_sector ,
+            //        dio->dio_sh[sh_index].sector, disk_index, atomic_read(&dio->dio_sh[sh_index].count), dio->dio_sh[sh_index].bio_complete_bit);
+    }
+}
+
+/**
+ * MikeT:
+ * when a bio completes, we need to mark on stripe_head's bio_complete_bit,
+ * and decrease shcount. When shcount == 1, we can know which bio is slow
+ * from bio_complete_bit, and we add the stripe_head to dio_sh_list for
+ * handle later(actually, very soon).
+ *
+ * However, when slow bio enters here, it can happen before or after computation finishes.
+ * Since when computation finishes, we also decrease shcount, so, here when shcount == 0,
+ * we know computation is not finishes, but we add stripe to dio_sh_list, meaning we don't
+ * need to wait for computation. o/w, shcount < 0, we just ignore this bio.
+ */
+static void dio_bio_mark_stripe(struct dio *dio, struct bio *bio)
+{
+    unsigned long flags;
+    int disk_index;
+    printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+    if(dio->isRAID)
+    {
+        struct dio_stripe_head *dsh = dio_bio_get_stripe(dio, bio);
+        disk_index = ( (bio)->bi_iter.bi_sector -dsh->sector) / STRIPE_SECTORS;
+        dsh->bio_complete_bit ^= 1L << disk_index;
+        //atomic_dec(&dio->dio_sh[sh_index].count);
+
+        if(atomic_dec_return(&dsh->count)==1)
+        {
+            long unsigned uf = 0xffffffff;
+            int i=0;
+            printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+            spin_lock_irqsave(&dio->bio_lock, flags);
+
+            dsh->next = dio->dio_sh_list;
+            dio->dio_sh_list = dsh;
+
+            uf = uf ^ dsh->bio_complete_bit;
+            while(i < dsh->disks)
+            {
+                if(uf & 1L)
+                {
+                    struct bio *bio = dsh->dev_bio[i];
+                    if(bio)
+                    {
+                        bio->bi_flags |= 1 << BIO_DIO_COMPLETE;
+                        dsh->target = i;
+                        dsh->target2 = -1;
+                    }
+                }
+                uf = uf>>1;
+                i++;
+            }
+
+            spin_unlock_irqrestore(&dio->bio_lock, flags);
+        }
+        else if(atomic_read(&dsh->count)==0)
+        {
+            bio_put(bio);
+            spin_lock_irqsave(&dio->bio_lock, flags);
+            dsh->next = dio->dio_sh_list;
+            dio->dio_sh_list = dsh;
+            spin_unlock_irqrestore(&dio->bio_lock, flags);
+        }
+        else if(atomic_read(&dsh->count)<0)
+        {
+            printk("MikeT: %s %s %d, computation has finished\n", __FILE__, __func__, __LINE__);
+            bio_put(bio);
+        }
+
+        printk("MikeT: %s %s %d, sh_sector: %lu, shcount: %d, bio_complete: %lx, target: %d\n",
+                    __FILE__, __func__, __LINE__,
+                    dsh->sector, atomic_read(&dsh->count), dsh->bio_complete_bit, dsh->target);
+    }
+}
 
 /*
  * Asynchronous IO callback.
@@ -350,27 +468,62 @@ static void dio_bio_end_aio(struct bio *bio, int error)
  * During I/O bi_private points at the dio.  After I/O, bi_private is used to
  * implement a singly-linked list of completed BIOs, at dio->bio_list.
  */
+ /**
+  * MikeT:
+  * A little modification is made here.
+  *
+  * If isRAID, we will wake_up_process(dio->waiter) every time, this function
+  * dio_bio_end_io is called.
+  *
+  * dio->waiter is set in dio_await_one or dio_await_one_stripe_head. In the orignial
+  * version, dio_await_one* will only be waken up when all bios finishes. See in the
+  * else branch, "dio->refcount == 1".
+  *
+  * This is bad when we do read to multiple stripes. e.g. we read two stripes,
+  * dio_await_one* won't be waken up until the first of two slow bios returns,
+  * and the second will return soon after the first because bio will be merged
+  * at block device level for performance consideration. So we will wait the
+  * slow bios and can only do things after slow bios return.
+  *
+  * As a result, I change it to wake up dio_wait_one* every time when a bio completes.
+  *
+  */
 static void dio_bio_end_io(struct bio *bio, int error)
 {
 	struct dio *dio = bio->bi_private;
 	unsigned long flags;
+
 	if(!dio)
     {
         printk("MikeT: %s %s %d, no dio\n", __FILE__, __func__, __LINE__);
         bio_put(bio);
         return;
     }
-
+    printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
 	dio->bio_list = bio;
-	if (--dio->refcount == 1 + ignoreR && dio->waiter)
-		wake_up_process(dio->waiter);
+	if (dio->isRAID)/**MikeT**/
+    {
+        --dio->refcount;
+        if(dio->waiter)
+            wake_up_process(dio->waiter);
+    }
+    else
+    {
+        if (--dio->refcount == 1 && dio->waiter)
+            wake_up_process(dio->waiter);
+    }
+
 	spin_unlock_irqrestore(&dio->bio_lock, flags);
 
-    bio->bi_flags |= 1 << BIO_DIO_COMPLETE;
+    //bio->bi_flags |= 1 << BIO_DIO_COMPLETE;
 }
 
+/**
+ * MikeT:
+ * bio end function for degraded read bio.
+ */
 static void dio_bio_end_pio(struct bio *bio, int error)
 {
     struct dio *dio = bio->bi_private;
@@ -387,8 +540,9 @@ static void dio_bio_end_pio(struct bio *bio, int error)
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
 	dio->bio_list = bio;
-	if (--dio->refcount == 1 + ignoreR && dio->waiter)
-		wake_up_process(dio->waiter);
+	--dio->refcount;
+	if(dio->waiter)
+        wake_up_process(dio->waiter);
 	spin_unlock_irqrestore(&dio->bio_lock, flags);
 }
 
@@ -437,6 +591,10 @@ dio_bio_alloc(struct dio *dio, struct dio_submit *sdio,
 	sdio->logical_offset_in_bio = sdio->cur_page_fs_offset;
 }
 
+/**
+ * MikeT:
+ * Before submit, we add it to stripe.
+ */
 /*
  * In the AIO read case we speculatively dirty the pages before starting IO.
  * During IO completion, any of these pages which happen to have been written
@@ -478,20 +636,8 @@ static inline void dio_bio_submit(struct dio *dio, struct dio_submit *sdio)
 			       sdio->logical_offset_in_bio);
 	else
 	{
-		if(dio->bio_record==NULL)
-		{
-            dio->bio_record = kmalloc(sizeof(struct bio_record), GFP_KERNEL);
-            dio->bio_record->bio = bio;
-            dio->bio_record->next = NULL;
-            dio->bio_record_tail = dio->bio_record;
-		}
-		else
-		{
-            dio->bio_record_tail->next = kmalloc(sizeof(struct bio_record), GFP_KERNEL);
-            dio->bio_record_tail->next->bio = bio;
-            dio->bio_record_tail->next->next = NULL;
-            dio->bio_record_tail = dio->bio_record_tail->next;
-		}
+	    dio_bio_add_to_stripe(dio, bio);
+
 		submit_bio(dio->rw, bio);
 	}
 
@@ -507,6 +653,47 @@ static inline void dio_cleanup(struct dio *dio, struct dio_submit *sdio)
 {
 	while (sdio->head < sdio->tail)
 		page_cache_release(dio->pages[sdio->head++]);
+}
+
+/*
+ * Wait for the next BIO to complete.  Remove it and return it.  NULL is
+ * returned once all BIOs have been completed.  This must only be called once
+ * all bios have been issued so that dio->refcount can only decrease.  This
+ * requires that that the caller hold a reference on the dio.
+ */
+ /**
+  * MikeT:
+  * It is similar to dio_await_one, however, we add condition dio->dio_sh_list == NULL
+  * in the while loop.
+  */
+static struct bio *dio_await_one_stripe_head(struct dio *dio)
+{
+	unsigned long flags;
+	struct bio *bio = NULL;
+
+	spin_lock_irqsave(&dio->bio_lock, flags);
+
+	/*
+	 * Wait as long as the list is empty and there are bios in flight.  bio
+	 * completion drops the count, maybe adds to the list, and wakes while
+	 * holding the bio_lock so we don't need set_current_state()'s barrier
+	 * and can call it after testing our condition.
+	 */
+	while (dio->refcount > 1 && dio->bio_list == NULL && dio->dio_sh_list == NULL) {
+		__set_current_state(TASK_UNINTERRUPTIBLE);
+		dio->waiter = current;
+		spin_unlock_irqrestore(&dio->bio_lock, flags);
+		io_schedule();
+		/* wake up sets us TASK_RUNNING */
+		spin_lock_irqsave(&dio->bio_lock, flags);
+		dio->waiter = NULL;
+	}
+	if (dio->bio_list) {
+		bio = dio->bio_list;
+		dio->bio_list = bio->bi_private;
+	}
+	spin_unlock_irqrestore(&dio->bio_lock, flags);
+	return bio;
 }
 
 /*
@@ -599,6 +786,12 @@ static void dio_await_completion(struct dio *dio)
 /*
  * Process one completed BIO.  No locks are held.
  */
+ /**
+  * MikeT:
+  * we call dio_bio_mark_stripe here. and We don't put bio, because we may want to use it
+  * for computation later.
+  * In dio_bio_mark_stripe, we will take care of normal bio and slow bio.
+  */
 static int dio_bio_complete_MikeT(struct dio *dio, struct bio *bio)
 {
 	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
@@ -619,6 +812,7 @@ static int dio_bio_complete_MikeT(struct dio *dio, struct bio *bio)
 			page_cache_release(page);
             //printk("MikeT: %s %s %d, Before put bio, i: %d\n", __FILE__, __func__, __LINE__, i);
 		}
+		dio_bio_mark_stripe(dio, bio);
 		//bio_put(bio);
 	}
 	return uptodate ? 0 : -EIO;
@@ -752,6 +946,13 @@ static addr_conv_t *to_addr_conv(struct r5conf *conf,
 {
     return percpu->scribble + sizeof(struct page *) * (conf->raid_disks + 2);
 }
+
+/**
+ * MikeT:
+ * This is the callback for async_xor.
+ * When compute is completed, we mark the degraded read bio as BIO_DIO_COMPLETE and
+ * add it to dio's bio_list.
+ */
 static void dio_bio_end_compute(void *bio_reference)
 {
     struct bio *bio = bio_reference;
@@ -770,6 +971,7 @@ static void dio_bio_end_compute(void *bio_reference)
     //mdelay(50);
     //struct dio *dio = bio->bi_private;
     printk("MikeT: %s %s %d, bio: %p\n", __FILE__, __func__, __LINE__, bio);
+    bio->bi_flags |= 1<<BIO_DIO_COMPLETE;
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
 	dio->bio_list = bio;
@@ -778,7 +980,14 @@ static void dio_bio_end_compute(void *bio_reference)
 	spin_unlock_irqrestore(&dio->bio_lock, flags);
 
 }
-static void dio_bio_do_compute5(struct dio *dio, struct bio *bio, int target, struct r5conf *conf, struct raid5_percpu *percpu)
+
+/**
+ * MikeT:
+ * Prepare for computation.
+ * we add page buffer and target page to xor_srcs and xor_dest, then submit as a async_xor job.
+ * Then computation finishes, it will call dio_bio_end_compute.
+ */
+static void dio_bio_do_compute5(struct dio *dio, struct bio *bio, struct dio_stripe_head *dsh, struct r5conf *conf, struct raid5_percpu *percpu)
 {
     struct page *parity = bio_page(bio);
     struct page **xor_srcs = percpu->scribble;
@@ -797,17 +1006,26 @@ static void dio_bio_do_compute5(struct dio *dio, struct bio *bio, int target, st
     //cpu = get_cpu();
     //pc = per_cpu_ptr(percpu, cpu);
 
-    printk("MikeT: %s %s %d, percpu %p, scribble %p\n", __FILE__, __func__, __LINE__, percpu, percpu->scribble);
+    //printk("MikeT: %s %s %d, percpu %p, scribble %p\n", __FILE__, __func__, __LINE__, percpu, percpu->scribble);
     printk("MikeT: %s %s %d, dio %p\n", __FILE__, __func__, __LINE__, dio);
     //xor_srcs = kmalloc(sizeof(struct page *) * (4+2) + sizeof(addr_conv_t)*(4+2), GFP_KERNEL);//pc->scribble;
-    printk("MikeT: %s %s %d, srcs: %p\n", __FILE__, __func__, __LINE__, xor_srcs);
+    //printk("MikeT: %s %s %d, srcs: %p\n", __FILE__, __func__, __LINE__, xor_srcs);
 
-    xor_dest = dio->pages[target];
+    xor_dest = bio_page(dsh->dev_bio[dsh->target]);
     xor_srcs[count++]=parity;
-    for(i=0;i<3;i++)
+    printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+    for(i=0;i<dsh->disks-1;i++)
     {
-        if(i!=target)
-            xor_srcs[count++]=dio->pages[i];
+        printk("MikeT: %s %s %d, %d\n", __FILE__, __func__, __LINE__, i);
+        if(i!=dsh->target)
+        {
+            printk("MikeT: %s %s %d, %d\n", __FILE__, __func__, __LINE__, i);
+            xor_srcs[count++]=bio_page(dsh->dev_bio[i]);
+            printk("MikeT: %s %s %d, %d\n", __FILE__, __func__, __LINE__, i);
+            bio_put(dsh->dev_bio[i]);
+            printk("MikeT: %s %s %d, %d\n", __FILE__, __func__, __LINE__, i);
+        }
+
     }
     printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
     init_async_submit(&submit, ASYNC_TX_FENCE|ASYNC_TX_XOR_ZERO_DST, NULL,
@@ -844,14 +1062,29 @@ static void dio_bio_do_compute5(struct dio *dio, struct bio *bio, int target, st
 
 }
 static void dio_await_completion_compute_MikeT(struct dio *dio);
+static inline int send_RAID_bio_MikeT(struct dio *dio, struct bio *rbio);
 
-
+/**
+ * MikeT:
+ * The work we need to do when we get the degraded read bio.
+ * We call dio_bio_do_compute5.
+ */
 static int dio_bio_complete_parity_MikeT(struct dio *dio, struct bio *bio)
 {
 	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+	struct dio_stripe_head *dsh;
     if (!dio)
     {
         printk("MikeT: %s %s %d, no dio\n", __FILE__, __func__, __LINE__);
+        kfree(bio_data(bio));
+        bio_put(bio);
+        return 0;
+    }
+
+    dsh  = dio_bio_get_stripe(dio, bio);
+    if( atomic_read(&dsh->count)==0)
+    {
+        printk("MikeT: %s %s %d, slow bio has returned\n", __FILE__, __func__, __LINE__);
         kfree(bio_data(bio));
         bio_put(bio);
         return 0;
@@ -874,8 +1107,9 @@ static int dio_bio_complete_parity_MikeT(struct dio *dio, struct bio *bio)
 		}
 		bio_put(bio);*/
 		unsigned long cpu;
-		struct mddev *mddev = bdev_get_queue(bio->bi_bdev)->queuedata;
-		struct r5conf *conf = mddev->private;
+
+		//struct mddev *mddev = bdev_get_queue(bio->bi_bdev)->queuedata;
+		struct r5conf *conf = dsh->conf;
 		struct raid5_percpu *r_percpu = conf->percpu;
 		struct raid5_percpu *percpu;
 		/***reconstruct***/
@@ -884,7 +1118,7 @@ static int dio_bio_complete_parity_MikeT(struct dio *dio, struct bio *bio)
 		cpu = get_cpu();
         percpu = per_cpu_ptr(r_percpu, cpu);
 
-		dio_bio_do_compute5(dio, bio, 1, conf, percpu);
+		dio_bio_do_compute5(dio, bio, dsh, conf, percpu);
 
 		put_cpu();
 		//page_cache_release(bio_page(bio));
@@ -892,17 +1126,157 @@ static int dio_bio_complete_parity_MikeT(struct dio *dio, struct bio *bio)
         //free_page(bio_page(bio));
         //bio_put(bio);
 
-        dio_await_completion_compute_MikeT(dio);
-        printk("MikeT: %s %s %d, after wait compute\n", __FILE__, __func__, __LINE__);
+        //dio_await_completion_compute_MikeT(dio);
+        //printk("MikeT: %s %s %d, after wait compute\n", __FILE__, __func__, __LINE__);
 
 	}
 	return uptodate ? 0 : -EIO;
 }
 
+/**
+ * MikeT:
+ * Work we need to do when we know we finish computing.
+ * free the temp page and degraded bio, and add the stripe to dio_sh_list
+ */
+static int dio_bio_complete_compute_MikeT(struct dio *dio, struct bio *bio)
+{
+    struct dio_stripe_head *dsh = dio_bio_get_stripe(dio, bio);
+    long unsigned flags;
+    kfree(bio_data(bio));
+    bio_put(bio);
+
+    if(atomic_dec_return(&dsh->count)<0)
+    {
+        printk("MikeT: %s %s %d, slow bio has return\n", __FILE__, __func__, __LINE__);
+        return 0;
+    }
+    spin_lock_irqsave(&dio->bio_lock, flags);
+    dsh->next = dio->dio_sh_list;
+    dio->dio_sh_list = dsh;
+    spin_unlock_irqrestore(&dio->bio_lock, flags);
+    return 0;
+}
+
+/**
+ * MikeT:
+ * This function is like a switch when we get a bio from bio_list.
+ * it works as dio_bio_complete, but more complex and actual work is done is several
+ * functions:
+ *     1) BIO_DIO_COMPLETE && BIO_NEED_PARITY:
+ *          meaning computation bio returns, call dio_bio_complete_compute_MikeT
+ *     2) BIO_DIO_COMPLETE:
+ *          meaning slow bio returns, call dio_bio_complete_MikeT
+ *     3) BIO_NEED_PARITY:
+ *          meaning degraded read bio returns, call dio_bio_complete_parity_MikeT
+ *     4) No both flag:
+ *          meaning norma bio returns, call dio_bio_complete_MikeT
+ */
+static int dio_bio_complete_stripe_head(struct dio *dio, struct bio *bio)
+{
+    // per stripe handle
+    if(unlikely(test_bit(BIO_DIO_COMPLETE, &bio->bi_flags)&&test_bit(BIO_NEED_PARITY, &bio->bi_flags)))
+    {
+        printk("MikeT: %s %s %d, computation bio returns\n", __FILE__, __func__, __LINE__);
+        //computation bio returns
+        dio_bio_complete_compute_MikeT(dio, bio);
+    }
+    else if(unlikely(test_bit(BIO_DIO_COMPLETE, &bio->bi_flags)))
+    {
+        printk("MikeT: %s %s %d, slow bio returns\n", __FILE__, __func__, __LINE__);
+        //the slow bio returns
+        dio_bio_complete_MikeT(dio, bio);
+    }
+    else if(unlikely(test_bit(BIO_NEED_PARITY, &bio->bi_flags)))
+    {
+        printk("MikeT: %s %s %d, read parity bio returns\n", __FILE__, __func__, __LINE__);
+        //read parity bio returns
+        dio_bio_complete_parity_MikeT(dio, bio);
+    }
+    else
+    {
+        printk("MikeT: %s %s %d, normal bio returns\n", __FILE__, __func__, __LINE__);
+        //normal bio returns
+        dio_bio_complete_MikeT(dio, bio);
+    }
+    return 0;
+}
+
+
+/**
+ * MikeT:
+ * When we grap a stripe_head from dio_sh_list, we do work depending on its shcount.
+ * 1) shcount == 1, this stripe_head is added to list by dio_bio_complete_MikeT, or
+ *    dio_bio_mark_stripe. It means we need to do degraded read now.
+ * 2) shcount < 1, this stripe_head is added to list maybe by dio_bio_complete_MikeT,
+ *    because slow bio returns earlier than computation. Or, it can be added by
+ *    dio_bio_complete_compute. It means we finished computation. Either case, we will
+ *    decrease the counter for dio, meaning one stripe finishes.
+ *
+ */
+static int dio_dsh_complete_stripe_head(struct dio *dio, struct dio_stripe_head *dsh)
+{
+    if(atomic_read(&dsh->count)==1)
+    {
+        send_RAID_bio_MikeT(dio, dsh->dev_bio[dsh->target]);
+    }
+    else if(atomic_read(&dsh->count)<1)
+    {
+        dio->sh_count--;
+    }
+    return 0;
+}
+
+/**
+ * MikeT:
+ * This function works as dio_await_completion.
+ * Differences are
+ *  1)  we use dio_await_one_stripe_head. dio_await_one_stripe_head will break while
+ *      loop when bio_list is not empty or dio_sh_list is not empty.
+ *  2)  we grap sh from dio_sh_list, and call dio_dsh_complete_stripe_head to handle
+ *      it.
+ *  3)  It breaks when dio->sh_count == 0, that is all stripes/bios finishes.
+ */
+static void dio_await_completion_stripe_head(struct dio *dio)
+{
+    struct bio *bio;
+    struct dio_stripe_head *dsh;
+    unsigned long flags;
+    do{
+        bio = NULL;
+        dsh = NULL;
+        bio = dio_await_one_stripe_head(dio);
+        if (bio)
+            dio_bio_complete_stripe_head(dio, bio);
+
+        spin_lock_irqsave(&dio->bio_lock, flags);
+        if (dio->dio_sh_list)
+        {
+            printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+            dsh = dio->dio_sh_list;
+            dio->dio_sh_list = dsh->next;
+        }
+        spin_unlock_irqrestore(&dio->bio_lock, flags);
+
+        if (dsh)
+        {
+            printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+            dio_dsh_complete_stripe_head(dio, dsh);
+        }
+
+        if (dio->sh_count == 0)
+            break;
+
+    }while(1);
+}
+
+/**
+ * MikeT:
+ * It simply break when there is ingoreR bio remaining
+ * It is not used in v2.
+ */
 static void dio_await_completion_MikeT(struct dio *dio)
 {
 	struct bio *bio;
-	struct bio_record *head,*next;
 
 	do {
 		bio = dio_await_one(dio);
@@ -912,18 +1286,13 @@ static void dio_await_completion_MikeT(struct dio *dio)
             break;
 	} while (bio);
 
-    head = dio->bio_record;
-	while(head!=NULL)
-    {
-        next = head->next;
-        if(test_bit(BIO_DIO_COMPLETE, &head->bio->bi_flags))
-            __clear_bit(BIO_DIO_COMPLETE, &head->bio->bi_flags);
-        else
-            head->bio->bi_flags |= 1 << BIO_DIO_COMPLETE;
-        //head->bio->dio_comp = !(head->bio->dio_comp);
-        head = next;
-    }
 }
+
+/**
+ * MikeT:
+ * a wait function after we submit degraded read bio.
+ * not used in v2.
+ */
 static void dio_await_completion_parity_MikeT(struct dio *dio)
 {
     struct bio *bio;
@@ -949,7 +1318,18 @@ static void dio_await_completion_parity_MikeT(struct dio *dio)
     }while(bio);
 
 }
-
+/**
+ * MikeT:
+ * make dio wait completion of computing.
+ *
+ * When compute is finished, the completion function send the degraded read bio to dio's bio_list,
+ * then, here we grap it from the list using dio_await_one.
+ *
+ * We check on the flags, when it has BIO_NEED_PARITY but no BIO_DIO_COMPLETE, it means it is the
+ * degraded read bio, o/w, it is the slow bio.
+ *
+ * This function is not used in v2.
+ */
 static void dio_await_completion_compute_MikeT(struct dio *dio)
 {
     struct bio *bio;
@@ -997,6 +1377,10 @@ static inline int drop_refcount(struct dio *dio)
 }
 
 /**
+ * MikeT:
+ * This is almost the same with original dio_complete(), except that I check
+ * refcount to see if it is 0 and set it to 0.
+ *
  * dio_complete() - called when all DIO BIO I/O has been completed
  * @offset: the byte offset in the file of the completed operation
  *
@@ -1012,7 +1396,6 @@ static ssize_t dio_complete_MikeT(struct dio *dio, loff_t offset, ssize_t ret,
 		bool is_async)
 {
 	ssize_t transferred = 0;
-	struct bio_record *head, *next;
 	if(dio->refcount!=0)
         drop_refcount(dio);
 	/*
@@ -1055,15 +1438,7 @@ static ssize_t dio_complete_MikeT(struct dio *dio, loff_t offset, ssize_t ret,
 
 		aio_complete(dio->iocb, ret, 0);
 	}
-    head = dio->bio_record;
-	while(head!=NULL)
-	{
-        next = head->next;
-        if(!test_bit(BIO_DIO_COMPLETE, &head->bio->bi_flags))
-        //if(!head->bio->dio_comp)
-            kfree(head);
-        head = next;
-	}
+
 
 	kmem_cache_free(dio_cache, dio);
 
@@ -1175,7 +1550,7 @@ static int get_more_blocks(struct dio *dio, struct dio_submit *sdio,
 	 */
 	ret = dio->page_errors;
 	if (ret == 0) {
-        printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+        //printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
 		BUG_ON(sdio->block_in_file >= sdio->final_block_in_request);
 		fs_startblk = sdio->block_in_file >> sdio->blkfactor;
 		fs_endblk = (sdio->final_block_in_request - 1) >>
@@ -1517,7 +1892,7 @@ static int do_direct_IO(struct dio *dio, struct dio_submit *sdio,
 				 */
 				unsigned long blkmask;
 				unsigned long dio_remainder;
-                printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+                //printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
 				ret = get_more_blocks(dio, sdio, map_bh);
 				if (ret) {
 					page_cache_release(page);
@@ -1639,8 +2014,15 @@ next_block:
 out:
 	return ret;
 }
-
-static inline int send_RAID_bio_MikeT(struct dio *dio, struct dio_submit *sdio, struct bio *rbio)
+/**
+ * MikeT:
+ * This function is used to assemble a bio to do degraded read.
+ * We allocate a temp page here, and flag the bio with BIO_NEED_PARITY.
+ *
+ * This temp page may or may not be used in computation, depending on
+ * the order of this bio and slow bio's arrival. It will be later freed.
+ */
+static inline int send_RAID_bio_MikeT(struct dio *dio, struct bio *rbio)
 {
     struct page *page;
     struct bio *bio;
@@ -1691,7 +2073,7 @@ static inline int send_RAID_bio_MikeT(struct dio *dio, struct dio_submit *sdio, 
     //bio->bi_seg_back_size = rbio->bi_seg_back_size;
     bio->bi_private = dio;
     bio->bi_end_io = dio_bio_end_pio;
-    bio->bi_flags |= 1<< BIO_NEED_PARITY;
+    bio->bi_flags |= 1 << BIO_NEED_PARITY;
     //bio->need_parity = true;
 
     //bio_add_page(bio, page, PAGE_SIZE, 0);
@@ -1726,11 +2108,17 @@ static inline int send_RAID_bio_MikeT(struct dio *dio, struct dio_submit *sdio, 
                bio->bi_phys_segments, bio->bi_seg_front_size, bio->bi_seg_back_size, atomic_read(&bio->bi_remaining),
                bio->bi_vcnt, bio->bi_max_vecs, atomic_read(&bio->bi_cnt), bio->bi_io_vec, bio->bi_pool );
 */
+    dio_bio_add_to_stripe(dio, bio);
     submit_bio(dio->rw, bio);
     //page_cache_release(page);
     return 0;
 }
 
+/**
+ * MikeT:
+ * Use a bio to decide whether it belongs to a RAID.
+ * Need improvement.
+ */
 static inline bool isRaid(struct bio *bi, bool rw)
 {
     struct request_queue *q = bdev_get_queue(bi->bi_bdev);
@@ -1744,6 +2132,69 @@ static inline bool isRaid(struct bio *bi, bool rw)
         return true;
     else
         return false;
+}
+
+/**
+ * MikeT:
+ * Use block_device to decide whether it is a RAID.
+ * Need improvement.
+ */
+static inline bool isRaid_(struct block_device *bdev, bool rw)
+{
+    struct request_queue *q = bdev_get_queue(bdev);
+    char *modname=NULL;
+    const char *name =NULL;
+    unsigned long kaoffset, kasize;
+    char namebuff[500];
+    name = kallsyms_lookup((unsigned long)(q->make_request_fn), &kasize, &kaoffset, &modname, namebuff);
+    printk("MikeT: %s %s %d, %s %d\n",__FILE__,__func__,__LINE__, name, strcmp(name, "md_make_request"));
+    if(strcmp(name, "md_make_request")==0&&rw==READ)
+        return true;
+    else
+        return false;
+}
+
+/**
+ * MikeT:
+ * Initial dio's stripe head list.
+ */
+static inline void init_dio_stripe_head(struct dio *dio, struct block_device *bdev, loff_t offset, loff_t end)
+{
+    struct mddev *mddev = bdev_get_queue(bdev)->queuedata;
+    struct r5conf *conf = mddev->private;
+    int i = 0, disks = conf->raid_disks;
+    sector_t sh_start = offset >> 9;
+    dio->sh_count = (end - offset) / STRIPE_SIZE / (conf->raid_disks - 1);
+    dio->dio_sh = (struct dio_stripe_head *)kmalloc(dio->sh_count * sizeof(struct dio_stripe_head), GFP_KERNEL);
+    dio->dio_sh_list = NULL;
+    for(i = 0; i < dio->sh_count; i++)
+    {
+        dio->dio_sh[i].conf = conf;
+        dio->dio_sh[i].sector = sh_start + i * STRIPE_SECTORS * (disks - 1);
+        dio->dio_sh[i].disks = disks;
+        atomic_set(&dio->dio_sh[i].count, 0);
+        dio->dio_sh[i].bio_complete_bit = 0xffffffff ^ ((1L << disks) - 1);
+        dio->dio_sh[i].dev_bio = (struct bio **)kmalloc(disks * sizeof(struct bio*), GFP_KERNEL);
+        memset(dio->dio_sh[i].dev_bio, 0, disks * sizeof(struct bio*));
+        dio->dio_sh[i].next = NULL;
+        dio->dio_sh[i].target = -1;
+        dio->dio_sh[i].target2 = -1;
+        printk("MikeT: %s %s %d, sh: %lx, disks: %d, shcount: %d, bio_complete: %lx\n",
+                __FILE__, __func__, __LINE__,
+                dio->dio_sh[i].sector, dio->dio_sh[i].disks, atomic_read(&dio->dio_sh[i].count), dio->dio_sh[i].bio_complete_bit);
+        //kfree(dio->dio_sh[i].dev_bio);
+    }
+}
+/**
+ * MikeT:
+ * free dio's stripe head list.
+ */
+static inline void free_dio_stripe_head(struct dio *dio)
+{
+    int i;
+    for(i = 0; i < dio->sh_count; i++)
+        kfree(dio->dio_sh[i].dev_bio);
+    kfree(dio->dio_sh);
 }
 
 /*
@@ -1788,10 +2239,14 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	struct buffer_head map_bh = { 0, };
 	struct blk_plug plug;
 	unsigned long align = offset | iov_iter_alignment(iter);
-	bool isRAID=false;
+
+
 
 	if (rw & WRITE)
 		rw = WRITE_ODIRECT;
+
+
+    //printk("MikeT: %s %s %d, offset: %lld, end: %lld\n", __FILE__, __func__, __LINE__, offset, end);
 
 	/*
 	 * Avoid references to bdev if not absolutely needed to give
@@ -1813,12 +2268,19 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	retval = -ENOMEM;
 	if (!dio)
 		goto out;
+
+
 	/*
 	 * Believe it or not, zeroing out the page array caused a .5%
 	 * performance regression in a database benchmark.  So, we take
 	 * care to only zero out what's needed.
 	 */
 	memset(dio, 0, offsetof(struct dio, pages));
+    if(bdev)
+        dio->isRAID = isRaid_(bdev, rw);
+    else
+        printk("MikeT: %s %s %d, no bdev\n", __FILE__, __func__, __LINE__);
+
 
 	dio->flags = flags;
 	if (dio->flags & DIO_LOCKING) {
@@ -1911,6 +2373,9 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 
 	blk_start_plug(&plug);
 
+	if(dio->isRAID)
+        init_dio_stripe_head(dio, bdev, offset, end);
+
 	retval = do_direct_IO(dio, &sdio, &map_bh);
 	if (retval)
 		dio_cleanup(dio, &sdio);
@@ -1939,8 +2404,9 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	}
 	if (sdio.bio)
 	{
-        isRAID = isRaid(sdio.bio, rw);
-        printk("MikeT: %s %s %d, %s\n",__FILE__,__func__,__LINE__, isRAID?"is RAID":"not RAID");
+	    if(!bdev)
+            dio->isRAID = isRaid(sdio.bio, rw);
+        printk("MikeT: %s %s %d, %s\n",__FILE__,__func__,__LINE__, dio->isRAID?"is RAID":"not RAID");
 		dio_bio_submit(dio, &sdio);
     }
 	blk_finish_plug(&plug);
@@ -1971,10 +2437,11 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 		retval = -EIOCBQUEUED;
 	else
 	{
-		if(isRAID&&ignoreR!=0)
+		if(dio->isRAID&&ignoreR!=0)
 		{
             printk("MikeT: %s %s %d, is RAID\n",__FILE__,__func__,__LINE__);
-            dio_await_completion_MikeT(dio);
+            /** MikeT: this is a new await function **/
+            dio_await_completion_stripe_head(dio);
         }
         else
         {
@@ -1983,8 +2450,8 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
         }
 
     }
-
-    if (isRAID && reconRead!=0 && ignoreR!=0)
+/*
+    if (dio->isRAID && reconRead!=0 && ignoreR!=0)
     {
         struct bio_record *head,*next;
         struct bio *rbio=NULL;
@@ -2001,20 +2468,22 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
         }
         if(rbio)
         {
-            send_RAID_bio_MikeT(dio, &sdio, rbio);
+            send_RAID_bio_MikeT(dio, rbio);
             printk("MikeT: %s %s %d, wait parity\n", __FILE__, __func__, __LINE__);
             dio_await_completion_parity_MikeT(dio);
             printk("MikeT: %s %s %d, after wait parity\n", __FILE__, __func__, __LINE__);
         }
-    }
+    }*/
+    if(dio->isRAID)
+        free_dio_stripe_head(dio);
 
-    if (isRAID && ignoreR!=0)
+    if (dio->isRAID && ignoreR!=0)
     {
         printk("MikeT: %s %s %d, drop_refcount: %d, is RAID\n",__FILE__,__func__,__LINE__, drop_refcount(dio));
         retval = dio_complete_MikeT(dio,offset,retval,false);
     }
-    else if ((!isRAID || ignoreR==0) && drop_refcount(dio) == 0 ) {
-        printk("MikeT: %s %s %d, %s\n",__FILE__,__func__,__LINE__, isRAID?"is RAID, ignoreR: 0":"not RAID");
+    else if ((!dio->isRAID || ignoreR==0) && drop_refcount(dio) == 0 ) {
+        printk("MikeT: %s %s %d, %s\n",__FILE__,__func__,__LINE__, dio->isRAID?"is RAID, ignoreR: 0":"not RAID");
 		retval = dio_complete(dio, offset, retval, false);
 	} else
 		BUG_ON(retval != -EIOCBQUEUED);
