@@ -5093,8 +5093,14 @@ static void raid5_parity_endio(struct bio *bi, int error)
     if(!error && uptodate)
     {
         //trace_block_bio_complete(bdev_get_queue(raid_bi->bi_bdev), raid_bi, 0);
-
-        bio_endio(raid_bi,0);
+        if(test_bit(BIO_NEED_PARITY, &raid_bi->bi_flags))
+            bio_endio(raid_bi, 0);
+        else
+        {
+            kfree(bio_data(raid_bi));
+            bio_put(raid_bi);
+        }
+        //bio_endio(raid_bi,0);
         if(atomic_dec_and_test(&conf->active_aligned_reads))
             wake_up(&conf->wait_for_stripe);
         return;
@@ -5143,7 +5149,8 @@ static void raid5_align_endio(struct bio *bi, int error)
             //        set_page_dirty_lock(page);
             //    page_cache_release(page);
 			//}
-			bio_endio(raid_bi, 0);
+			bio_put(raid_bi);
+			//bio_endio(raid_bi, 0);
         }
         else
         {
