@@ -400,6 +400,7 @@ struct r5conf {
 	int			max_degraded;
 	int			raid_disks;
 	int			max_nr_stripes;
+	int         slow_disk; //MikeT: added
 
 	/* reshape_progress is the leading edge of a 'reshape'
 	 * It has value MaxSector when no reshape is happening
@@ -561,4 +562,7 @@ static inline int algorithm_is_DDF(int layout)
 extern int md_raid5_congested(struct mddev *mddev, int bits);
 extern void md_raid5_kick_device(struct r5conf *conf);
 extern int raid5_set_cache_size(struct mddev *mddev, int size);
+extern sector_t raid5_compute_sector_MikeT(struct r5conf *conf, sector_t r_sector,
+                                           int previous, int *dd_idx, int *pd, int *qd, int *ddf);
+extern void raid5_compute_dnr_MikeT(struct r5conf *conf, int previous, int *dd_idx, int *pd, int *qd);
 #endif

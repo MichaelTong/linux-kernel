@@ -2607,7 +2607,7 @@ static void error(struct mddev *mddev, struct md_rdev *rdev)
            conf->raid_disks - mddev->degraded);
 }
 
-static sector_t raid5_compute_sector_MikeT(struct r5conf *conf, sector_t r_sector,
+sector_t raid5_compute_sector_MikeT(struct r5conf *conf, sector_t r_sector,
                                            int previous, int *dd_idx, int *pd, int *qd, int *ddf)
 {
     sector_t stripe, stripe2;
@@ -2847,6 +2847,139 @@ static sector_t raid5_compute_sector_MikeT(struct r5conf *conf, sector_t r_secto
     return new_sector;
 
 }
+
+void raid5_compute_dnr_MikeT(struct r5conf *conf, int previous, int *dd_idx, int *pd, int *qd)
+{
+    int pd_idx=*pd, qd_idx=*qd;
+    int algorithm = previous ? conf->prev_algo
+                    : conf->algorithm;
+    int raid_disks = previous ? conf->previous_raid_disks
+                     : conf->raid_disks;
+
+    switch(conf->level)
+    {
+    case 4:
+        break;
+    case 5:
+        switch (algorithm)
+        {
+        case ALGORITHM_LEFT_ASYMMETRIC:
+            if (*dd_idx >= pd_idx)
+                (*dd_idx)--;
+            break;
+        case ALGORITHM_RIGHT_ASYMMETRIC:
+            if (*dd_idx >= pd_idx)
+                (*dd_idx)--;
+            break;
+        case ALGORITHM_LEFT_SYMMETRIC:
+            *dd_idx = (*dd_idx - 1 - pd_idx + raid_disks) % raid_disks;
+            break;
+        case ALGORITHM_RIGHT_SYMMETRIC:
+            *dd_idx = (*dd_idx - 1 - pd_idx + raid_disks) % raid_disks;
+            break;
+        case ALGORITHM_PARITY_0:
+            (*dd_idx)--;
+            break;
+        case ALGORITHM_PARITY_N:
+            break;
+        default:
+            BUG();
+        }
+        break;
+    case 6:
+
+        switch (algorithm)
+        {
+        case ALGORITHM_LEFT_ASYMMETRIC:
+            if (pd_idx == raid_disks-1)
+            {
+                (*dd_idx)--;	/* Q D D D P */
+            }
+            else if (*dd_idx >= pd_idx)
+                (*dd_idx) -= 2; /* D D P Q D */
+            break;
+        case ALGORITHM_RIGHT_ASYMMETRIC:
+            if (pd_idx == raid_disks-1)
+            {
+                (*dd_idx)--;	/* Q D D D P */
+            }
+            else if (*dd_idx >= pd_idx)
+                (*dd_idx) -= 2; /* D D P Q D */
+            break;
+        case ALGORITHM_LEFT_SYMMETRIC:
+            *dd_idx = (*dd_idx - pd_idx - 2 + raid_disks) % raid_disks;
+            break;
+        case ALGORITHM_RIGHT_SYMMETRIC:
+            *dd_idx = (*dd_idx - pd_idx - 2 + raid_disks) % raid_disks;
+            break;
+
+        case ALGORITHM_PARITY_0:
+            (*dd_idx) -= 2;
+            break;
+        case ALGORITHM_PARITY_N:
+            break;
+
+        case ALGORITHM_ROTATING_ZERO_RESTART:
+            /* Exactly the same as RIGHT_ASYMMETRIC, but or
+             * of blocks for computing Q is different.
+             */
+            if (pd_idx == raid_disks-1)
+            {
+                (*dd_idx)--;	/* Q D D D P */
+            }
+            else if (*dd_idx >= pd_idx)
+                (*dd_idx) -= 2; /* D D P Q D */
+            break;
+
+        case ALGORITHM_ROTATING_N_RESTART:
+            /* Same a left_asymmetric, by first stripe is
+             * D D D P Q  rather than
+             * Q D D D P
+             */
+            if (pd_idx == raid_disks-1)
+            {
+                (*dd_idx)--;	/* Q D D D P */
+            }
+            else if (*dd_idx >= pd_idx)
+                (*dd_idx) -= 2; /* D D P Q D */
+            break;
+
+        case ALGORITHM_ROTATING_N_CONTINUE:
+            /* Same as left_symmetric but Q is before P */
+            *dd_idx = (*dd_idx - pd_idx - 1 + raid_disks) % raid_disks;
+            break;
+
+        case ALGORITHM_LEFT_ASYMMETRIC_6:
+            /* RAID5 left_asymmetric, with Q on last device */
+            if (*dd_idx >= pd_idx)
+                (*dd_idx)--;
+            break;
+
+        case ALGORITHM_RIGHT_ASYMMETRIC_6:
+            if (*dd_idx >= pd_idx)
+                (*dd_idx)--;
+            break;
+
+        case ALGORITHM_LEFT_SYMMETRIC_6:
+            *dd_idx = (*dd_idx - pd_idx - 1 + raid_disks) % (raid_disks-1);
+            break;
+
+        case ALGORITHM_RIGHT_SYMMETRIC_6:
+            *dd_idx = (*dd_idx - pd_idx - 1 + raid_disks) % (raid_disks-1);
+            break;
+
+        case ALGORITHM_PARITY_0_6:
+            (*dd_idx)--;
+            break;
+
+        default:
+            BUG();
+        }
+        break;
+    }
+
+}
+
 
 /*
  * Input: a 'big' sector number,
@@ -7219,7 +7352,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
     else
         printk(KERN_INFO "md/raid:%s: allocated %dkB\n",
                mdname(mddev), memory);
-
+    conf->slow_disk = -1;//MikeT: added
     sprintf(pers_name, "raid%d", mddev->new_level);
     conf->thread = md_register_thread(raid5d, mddev, pers_name);
     printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->thread);
