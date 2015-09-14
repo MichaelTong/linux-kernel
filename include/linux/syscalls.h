@@ -879,5 +879,6 @@ asmlinkage long sys_getrandom(char __user *buf, size_t count,
 asmlinkage long sys_bpf(int cmd, union bpf_attr *attr, unsigned int size);
 asmlinkage void sys_changeIgnoreK(int newval);
 asmlinkage void sys_changeIgnoreR(int newval);
-asmlinkage void sys_changeReconRead(int newval);
+asmlinkage void sys_changeReadPolicy(int newval);
+asmlinkage void sys_changeEnableCount(int newval);
 #endif

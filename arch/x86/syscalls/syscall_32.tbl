@@ -366,4 +366,5 @@
 357	i386	bpf			sys_bpf
 358     i386	changeIgnoreK           sys_changeIgnoreK
 359     i386	changeIgnoreR           sys_changeIgnoreR
-360	i386	changeReconRead		sys_changeReconRead
+360	i386	changeReadPolicy	sys_changeReadPolicy
+361	i386	changeEnableCount	sys_changeEnableCount

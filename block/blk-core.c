@@ -3056,6 +3056,7 @@ static void flush_plug_callbacks(struct blk_plug *plug, bool from_schedule)
 							  struct blk_plug_cb,
 							  list);
 			list_del(&cb->list);
+			//printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
 			cb->callback(cb, from_schedule);
 		}
 	}
@@ -3093,7 +3094,7 @@ void blk_flush_plug_list(struct blk_plug *plug, bool from_schedule)
 	struct request *rq;
 	LIST_HEAD(list);
 	unsigned int depth;
-
+    //printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
 	flush_plug_callbacks(plug, from_schedule);
 
 	if (!list_empty(&plug->mq_list))

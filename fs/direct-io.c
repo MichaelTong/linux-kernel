@@ -57,7 +57,7 @@
 #define STRIPE_SECTORS		(STRIPE_SIZE>>9)
 
 extern int ignoreR;
-extern int reconRead;
+extern int readPolicy;
 /** MikeT: stripe_head for dio */
 struct dio_stripe_head{
     struct r5conf *conf; //RAID configuration
@@ -65,9 +65,9 @@ struct dio_stripe_head{
     sector_t offset; // Starting reading sector
     sector_t end; // Ending reading sector
     bool full;
-    short pd_idx; // Parity disk
-    short qd_idx; // 2nd Parity disk in RAID6
-    short ddf_layout; // layout
+    int pd_idx; // Parity disk
+    int qd_idx; // 2nd Parity disk in RAID6
+    int ddf_layout; // layout
     atomic_t count; // shcount
     int disks; // total disks for RAID
     int cpu;
@@ -327,161 +327,6 @@ static void dio_aio_complete_work(struct work_struct *work)
 
 static int dio_bio_complete(struct dio *dio, struct bio *bio);
 
-/**
- * MikeT:
- * get a corresponding stripe for the bio
- */
-static struct dio_stripe_head *dio_bio_get_stripe(struct dio *dio, struct bio *bio)
-{
-    if(dio->isRAID)
-    {
-        int sh_index =  (bio)->bi_iter.bi_sector / ((dio->dio_sh[0].disks - 1) * STRIPE_SECTORS) - dio->dio_sh_start;
-        return &dio->dio_sh[sh_index];
-    }
-    return NULL;
-}
-/**
- * MikeT:
- * link bio to its stripe.
- */
-static void dio_bio_add_to_stripe(struct dio *dio, struct bio *bio)
-{
-    if(dio->isRAID)
-    {
-        struct dio_stripe_head *dsh = dio_bio_get_stripe(dio, bio);
-        int dd_idx, pd_idx, qd_idx, ddf;
-        raid5_compute_sector_MikeT(dsh->conf, bio->bi_iter.bi_sector, 0, &dd_idx, &pd_idx, &qd_idx, &ddf);
-        dsh->pd_idx = pd_idx;
-        dsh->qd_idx = qd_idx;
-        dsh->ddf_layout = ddf;
-
-        printk("MikeT: %s %s %d, dd_idx %d, pd_idx %d, qd_idx %d, ddf %d\n", __FILE__, __func__, __LINE__, dd_idx, pd_idx, qd_idx, ddf);
-        if(test_bit(BIO_NEED_PARITY, &bio->bi_flags))
-            dsh->dev_bio[pd_idx] = bio;
-        else
-        {
-            printk("MikeT: %s %s %d, %p\n", __FILE__, __func__, __LINE__, dsh);
-            dsh->dev_bio[dd_idx] = bio;
-            atomic_inc(&dsh->count);
-        }
-        if(atomic_read(&dsh->count) == dsh->disks - 1)
-        {
-            printk("MikeT: %s %s %d, %p\n", __FILE__, __func__, __LINE__, dsh);
-            dsh->full = true;
-        }
-            //printk("MikeT: %s %s %d, sh_index: %d, %lx sector: %lx, disks: %d, shcount: %d, bio_complete: %lx\n",
-            //        __FILE__, __func__, __LINE__, sh_index, (bio)->bi_iter.bi_sector ,
-            //        dio->dio_sh[sh_index].sector, disk_index, atomic_read(&dio->dio_sh[sh_index].count), dio->dio_sh[sh_index].bio_complete_bit);
-    }
-}
-
-/**
- * MikeT:
- * when a bio completes, we need to mark on stripe_head's bio_complete_bit,
- * and decrease shcount. When shcount == 1, we can know which bio is slow
- * from bio_complete_bit, and we add the stripe_head to dio_sh_list for
- * handle later(actually, very soon).
- *
- * However, when slow bio enters here, it can happen before or after computation finishes.
- * Since when computation finishes, we also decrease shcount, so, here when shcount == 0,
- * we know computation is not finishes, but we add stripe to dio_sh_list, meaning we don't
- * need to wait for computation. o/w, shcount < 0, we just ignore this bio.
- */
-static void dio_bio_mark_stripe(struct dio *dio, struct bio *bio)
-{
-    unsigned long flags;
-    int disk_index;
-    printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
-    if(dio->isRAID)
-    {
-        struct dio_stripe_head *dsh = dio_bio_get_stripe(dio, bio);
-        raid5_compute_sector_MikeT(dsh->conf, bio->bi_iter.bi_sector, 0, &disk_index, NULL, NULL, NULL);
-        //disk_index = ( (bio)->bi_iter.bi_sector -dsh->sector) / STRIPE_SECTORS;
-        dsh->bio_complete_bit ^= 1L << disk_index;
-        //atomic_dec(&dio->dio_sh[sh_index].count);
-
-        if(!(bio->bi_iter.bi_sector < dsh->offset || bio->bi_iter.bi_sector >= dsh->end))
-        {
-        	struct bio_vec *bvec;
-            unsigned i;
-            bio_for_each_segment_all(bvec, bio, i) {
-                struct page *page = bvec->bv_page;
-
-                if (dio->rw == READ && !PageCompound(page))
-                    set_page_dirty_lock(page);
-                page_cache_release(page);
-            //printk("MikeT: %s %s %d, Before put bio, i: %d\n", __FILE__, __func__, __LINE__, i);
-            }
-        }
-
-
-        if(atomic_dec_return(&dsh->count)==1 && dsh->full )
-        {
-            long unsigned uf = 0xffffffff;
-            int i=0;
-            printk("MikeT: %s %s %d, diskindex: %d\n", __FILE__, __func__, __LINE__, disk_index);
-            spin_lock_irqsave(&dio->bio_lock, flags);
-
-            dsh->next = dio->dio_sh_list;
-            dio->dio_sh_list = dsh;
-
-            uf = uf ^ dsh->bio_complete_bit;
-            while(i < dsh->disks)
-            {
-                if(uf & 1L)
-                {
-                    struct bio *bio = dsh->dev_bio[i];
-                    if(bio)
-                    {
-                        //bio->bi_flags |= 1 << BIO_DIO_COMPLETE;
-                        dsh->target = i;
-                        dsh->target2 = -1;
-                        dsh->conf->slow_disk = i;
-                    }
-                }
-                uf = uf>>1;
-                i++;
-            }
-            printk("MikeT: %s %s %d, slow disk: %d\n", __FILE__, __func__, __LINE__, dsh->conf->slow_disk);
-            spin_unlock_irqrestore(&dio->bio_lock, flags);
-        }
-        else if(atomic_read(&dsh->count)==0)
-        {
-            struct bio *pbio = dsh->dev_bio[dsh->pd_idx];
-            int i = 0;
-            while(i < dsh->disks)
-            {
-                if(dsh->dev_bio[i]&&i!=dsh->pd_idx)
-                {
-                    if(dsh->dev_bio[i]->bi_iter.bi_sector < dsh->offset || dsh->dev_bio[i]->bi_iter.bi_sector >= dsh->end)
-                    {
-                        kfree(bio_data(dsh->dev_bio[i]));
-                    }
-                    bio_put(dsh->dev_bio[i]);
-                }
-                i++;
-            }
-//            bio_put(bio);
-            spin_lock_irqsave(&dio->bio_lock, flags);
-            dsh->next = dio->dio_sh_list;
-            dio->dio_sh_list = dsh;
-            spin_unlock_irqrestore(&dio->bio_lock, flags);
-
-            if(pbio)
-                pbio->bi_flags ^= 1 << BIO_NEED_PARITY;
-
-        }
-        else if(atomic_read(&dsh->count)<0)
-        {
-            printk("MikeT: %s %s %d, computation has finished\n", __FILE__, __func__, __LINE__);
-            bio_put(bio);
-        }
-
-        printk("MikeT: %s %s %d, sh_sector: %lu, shcount: %d, bio_complete: %lx, target: %d\n",
-                    __FILE__, __func__, __LINE__,
-                    dsh->sector, atomic_read(&dsh->count), dsh->bio_complete_bit, dsh->target);
-    }
-}
 
 /*
  * Asynchronous IO callback.
@@ -544,17 +389,18 @@ static void dio_bio_end_io(struct bio *bio, int error)
 	struct dio *dio = bio->bi_private;
 	unsigned long flags;
 
-	if(!dio)
+    printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+    if(test_bit(BIO_DIO_COMPLETE, &bio->bi_flags))
     {
-        printk("MikeT: %s %s %d, no dio\n", __FILE__, __func__, __LINE__);
+        if(test_bit(BIO_FREE_DATA, &bio->bi_flags))
+            kfree(bio_data(bio));
         bio_put(bio);
         return;
     }
-    printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
 	dio->bio_list = bio;
-	if (dio->isRAID)/**MikeT**/
+	if (dio->isRAID && readPolicy != 0)/**MikeT**/
     {
         --dio->refcount;
         if(dio->waiter)
@@ -581,13 +427,15 @@ static void dio_bio_end_pio(struct bio *bio, int error)
     unsigned long flags;
 
     printk("MikeT: %s %s %d, parity bio end.\n", __FILE__, __func__, __LINE__);
-    if(!dio)
+
+    if(!test_bit(BIO_NEED_PARITY, &bio->bi_flags))
     {
-        printk("MikeT: %s %s %d, no dio\n", __FILE__, __func__, __LINE__);
         kfree(bio_data(bio));
         bio_put(bio);
         return;
     }
+
+
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
 	dio->bio_list = bio;
@@ -617,6 +465,305 @@ void dio_end_io(struct bio *bio, int error)
 		dio_bio_end_io(bio, error);
 }
 EXPORT_SYMBOL_GPL(dio_end_io);
+
+
+
+/**
+ * MikeT:
+ * get a corresponding stripe for the bio
+ */
+static struct dio_stripe_head *dio_bio_get_stripe(struct dio *dio, struct bio *bio)
+{
+    if(dio->isRAID)
+    {
+        int sh_index =  (bio)->bi_iter.bi_sector / ((dio->dio_sh[0].disks - 1) * STRIPE_SECTORS) - dio->dio_sh_start;
+        return &dio->dio_sh[sh_index];
+    }
+    return NULL;
+}
+/**
+ * MikeT:
+ * link bio to its stripe.
+ */
+static void dio_bio_add_to_stripe(struct dio *dio, struct bio *bio)
+{
+    if(dio->isRAID)
+    {
+        struct dio_stripe_head *dsh = dio_bio_get_stripe(dio, bio);
+        int dd_idx, pd_idx, qd_idx, ddf;
+        raid5_compute_sector_MikeT(dsh->conf, bio->bi_iter.bi_sector, 0, &dd_idx, &pd_idx, &qd_idx, &ddf);
+        dsh->pd_idx = pd_idx;
+        dsh->qd_idx = qd_idx;
+        dsh->ddf_layout = ddf;
+
+        printk("MikeT: %s %s %d, dd_idx %d, pd_idx %d, qd_idx %d, ddf %d\n", __FILE__, __func__, __LINE__, dd_idx, pd_idx, qd_idx, ddf);
+        if(test_bit(BIO_NEED_PARITY, &bio->bi_flags))
+        {
+            dsh->dev_bio[pd_idx] = bio;
+            if(readPolicy == 2)
+                atomic_inc(&dsh->count);
+        }
+        else
+        {
+            printk("MikeT: %s %s %d, %p\n", __FILE__, __func__, __LINE__, dsh);
+            dsh->dev_bio[dd_idx] = bio;
+            atomic_inc(&dsh->count);
+        }
+        if(readPolicy ==1 && atomic_read(&dsh->count) == dsh->disks - dsh->conf->max_degraded)
+        {
+            printk("MikeT: %s %s %d, reactive, full read, stripe head starting: %ld\n", __FILE__, __func__, __LINE__, dsh->sector);
+            dsh->full = true;
+        }
+        else if(readPolicy == 2)
+        {
+            if(atomic_read(&dsh->count) == dsh->disks)
+            {
+                printk("MikeT: %s %s %d, proactive, full read, stripe head starting: %ld\n", __FILE__, __func__, __LINE__, dsh->sector);
+                dsh->full = true;
+            }
+            else
+                dsh->full = false;
+        }
+            //printk("MikeT: %s %s %d, sh_index: %d, %lx sector: %lx, disks: %d, shcount: %d, bio_complete: %lx\n",
+            //        __FILE__, __func__, __LINE__, sh_index, (bio)->bi_iter.bi_sector ,
+            //        dio->dio_sh[sh_index].sector, disk_index, atomic_read(&dio->dio_sh[sh_index].count), dio->dio_sh[sh_index].bio_complete_bit);
+    }
+}
+
+/**
+ * MikeT:
+ * This function is used to assemble a bio to do degraded read.
+ * We allocate a temp page here, and flag the bio with BIO_NEED_PARITY.
+ *
+ * This temp page may or may not be used in computation, depending on
+ * the order of this bio and slow bio's arrival. It will be later freed.
+ */
+static inline int send_RAID_bio_MikeT(struct dio *dio, struct bio *rbio)
+{
+    struct page *page;
+    struct bio *bio;
+
+    char *tmp = kmalloc(4096, GFP_KERNEL);
+    page = virt_to_page(tmp);
+
+    printk("MikeT: %s %s %d, page %p, tmp:%p\n", __FILE__, __func__, __LINE__,kmap(page),tmp);
+    if(IS_ERR(page))
+    {
+            printk("MikeT: %s %s %d, error page\n", __FILE__, __func__, __LINE__);
+            kfree(tmp);
+            return -1;
+    }
+
+    printk("MikeT: %s %s %d, get page: %p\n", __FILE__, __func__, __LINE__,page);
+    bio = bio_kmalloc(GFP_KERNEL, 1);
+    bio->bi_bdev = rbio->bi_bdev;
+    bio->bi_rw = READ;
+
+    bio->bi_iter.bi_sector = rbio->bi_iter.bi_sector;
+    bio->bi_iter.bi_size = rbio->bi_iter.bi_size;
+
+    bio->bi_private = dio;
+    bio->bi_end_io = dio_bio_end_pio;
+    bio->bi_flags |= 1 << BIO_NEED_PARITY;
+    bio->bi_flags |= 1 << BIO_FREE_DATA;
+
+    bio->bi_io_vec[0].bv_page = page;
+    bio->bi_io_vec[0].bv_len = PAGE_SIZE;
+    bio->bi_io_vec[0].bv_offset = 0;
+    bio->bi_vcnt++;
+    dio->refcount++;
+
+    dio_bio_add_to_stripe(dio, bio);
+    submit_bio(dio->rw, bio);
+    return 0;
+}
+
+/**
+ * MikeT:
+ * when a bio completes, we need to mark on stripe_head's bio_complete_bit,
+ * and decrease shcount. When shcount == 1, we can know which bio is slow
+ * from bio_complete_bit, and we add the stripe_head to dio_sh_list for
+ * handle later(actually, very soon).
+ *
+ * However, when slow bio enters here, it can happen before or after computation finishes.
+ * Since when computation finishes, we also decrease shcount, so, here when shcount == 0,
+ * we know computation is not finishes, but we add stripe to dio_sh_list, meaning we don't
+ * need to wait for computation. o/w, shcount < 0, we just ignore this bio.
+ */
+static void dio_bio_mark_stripe(struct dio *dio, struct bio *bio)
+{
+    unsigned long flags;
+    int disk_index;
+    printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
+    if(dio->isRAID)
+    {
+        struct dio_stripe_head *dsh = dio_bio_get_stripe(dio, bio);
+        disk_index = 0;
+        while(disk_index < dsh->disks)
+        {
+            if(dsh->dev_bio[disk_index] == bio)
+            {
+                break;
+            }
+            disk_index++;
+        }
+
+        dsh->bio_complete_bit ^= 1L << disk_index;
+
+        if(!test_bit(BIO_FREE_DATA, &bio->bi_flags))
+        {
+        	struct bio_vec *bvec;
+            unsigned i;
+            bio_for_each_segment_all(bvec, bio, i) {
+                struct page *page = bvec->bv_page;
+
+                if (dio->rw == READ && !PageCompound(page))
+                    set_page_dirty_lock(page);
+                page_cache_release(page);
+            }
+        }
+        atomic_dec(&dsh->count);
+
+        if(readPolicy == 1)
+        {
+            if(atomic_read(&dsh->count)==1 && dsh->full)
+            {
+                long unsigned uf = 0xffffffff;
+                int i=0;
+                printk("MikeT: %s %s %d, diskindex: %d\n", __FILE__, __func__, __LINE__, disk_index);
+
+                uf = uf ^ dsh->bio_complete_bit;
+                while(i < dsh->disks)
+                {
+                    if(uf & 1L)
+                    {
+                        struct bio *bio = dsh->dev_bio[i];
+                        if(bio)
+                        {
+                            //bio->bi_flags |= 1 << BIO_DIO_COMPLETE;
+                            dsh->target = i;
+                            dsh->target2 = -1;
+                            raid5_record_slow(dsh->conf, i);
+                            break;
+                        }
+                    }
+                    uf = uf>>1;
+                    i++;
+                }
+                printk("MikeT: %s %s %d, slow disk: %d\n", __FILE__, __func__, __LINE__, dsh->conf->slow_disk);
+                send_RAID_bio_MikeT(dio, dsh->dev_bio[dsh->target]);
+            }
+            else if(atomic_read(&dsh->count)==0)
+            {
+                //slow bio returns first
+                struct bio *pbio = dsh->dev_bio[dsh->pd_idx];
+                int i = 0;
+                if(!pbio||!test_bit(BIO_UPTODATE, &pbio->bi_flags))
+                {
+                    while(i < dsh->disks)
+                    {
+                        if(dsh->dev_bio[i]&&i!=dsh->pd_idx)
+                        {
+                            if(test_bit(BIO_FREE_DATA, &dsh->dev_bio[i]->bi_flags))
+                            {
+                                kfree(bio_data(dsh->dev_bio[i]));
+                            }
+                            bio_put(dsh->dev_bio[i]);
+                        }
+                        i++;
+                    }
+
+                }
+                if(pbio)
+                    pbio->bi_flags ^= 1 << BIO_NEED_PARITY;
+                spin_lock_irqsave(&dio->bio_lock, flags);
+                dsh->next = dio->dio_sh_list;
+                dio->dio_sh_list = dsh;
+                spin_unlock_irqrestore(&dio->bio_lock, flags);
+
+
+            }
+            else if(atomic_read(&dsh->count)<0)
+            {
+                if(disk_index == dsh->pd_idx)
+                    printk("MikeT: %s %s %d, slow bio has returned\n", __FILE__, __func__, __LINE__);
+                else
+                    printk("MikeT: %s %s %d, computation has finished\n", __FILE__, __func__, __LINE__);
+                if(test_bit(BIO_FREE_DATA, &bio->bi_flags))
+                    kfree(bio_data(bio));
+                bio_put(bio);
+            }
+        }
+        else if(readPolicy == 2)
+        {
+            if(atomic_read(&dsh->count)==1 && dsh->full)
+            {
+                long unsigned uf = 0xffffffff;
+                int i=0, j;
+                printk("MikeT: %s %s %d, diskindex: %d\n", __FILE__, __func__, __LINE__, disk_index);
+                spin_lock_irqsave(&dio->bio_lock, flags);
+
+                dsh->next = dio->dio_sh_list;
+                dio->dio_sh_list = dsh;
+
+                uf = uf ^ dsh->bio_complete_bit;
+                while(i < dsh->disks)
+                {
+                    if(uf & 1L)
+                    {
+                        struct bio *bio = dsh->dev_bio[i];
+                        if(i == dsh->pd_idx || i == dsh->qd_idx)
+                        {
+                            bio->bi_flags ^= 1 << BIO_NEED_PARITY;
+                            atomic_dec(&dsh->count);
+                            for(j = 0; j < dsh->disks; j++)
+                            {
+                                bio = dsh->dev_bio[j];
+                                if(j==i)
+                                    continue;
+                                if(test_bit(BIO_FREE_DATA, &bio->bi_flags))
+                                    kfree(bio_data(bio));
+                                bio_put(bio);
+                            }
+                        }
+                        else
+                        {
+                            dsh->target = i;
+                            dsh->target2 = -1;
+                        }
+                        raid5_record_slow(dsh->conf, i);
+                        break;
+                    }
+                    uf = uf>>1;
+                    i++;
+                }
+                printk("MikeT: %s %s %d, slow disk: %d\n", __FILE__, __func__, __LINE__, dsh->conf->slow_disk);
+                spin_unlock_irqrestore(&dio->bio_lock, flags);
+            }
+            else if(atomic_read(&dsh->count)<1)
+            {
+                if(atomic_read(&dsh->count) == 0)
+                {//slow bio returns before computation ends.
+                    if(dsh->dev_bio[dsh->pd_idx])
+                        dsh->dev_bio[dsh->pd_idx]->bi_flags ^= 1 << BIO_NEED_PARITY;
+                    spin_lock_irqsave(&dio->bio_lock, flags);
+                    dsh->next = dio->dio_sh_list;
+                    dio->dio_sh_list = dsh;
+                    spin_unlock_irqrestore(&dio->bio_lock, flags);
+                }
+                if(test_bit(BIO_FREE_DATA, &bio->bi_flags))
+                    kfree(bio_data(bio));
+                bio_put(bio);
+            }
+        }
+
+
+        printk("MikeT: %s %s %d, sh_sector: %lu, shcount: %d, bio_complete: %lx, target: %d\n",
+                    __FILE__, __func__, __LINE__,
+                    dsh->sector, atomic_read(&dsh->count), dsh->bio_complete_bit, dsh->target);
+    }
+}
+
 
 static inline void
 dio_bio_alloc(struct dio *dio, struct dio_submit *sdio,
@@ -666,21 +813,6 @@ static inline void dio_bio_submit(struct dio *dio, struct dio_submit *sdio)
 
 	if (dio->is_async && dio->rw == READ)
 		bio_set_pages_dirty(bio);
-/*
-    if(reconRead)
-    {
-        printk("MikeT: %s %s %d, "
-               "bio %p, bi_next %p, bi_bdev %p, bi_flags %lx, bi_rw %lx; "
-               "bi_iter: bi_sector %u, bi_size %u, bi_idx %u, bi_bvec_done %u; "
-               "bi_phys_segments %u, bi_seg_front_size %u, bi_seg_back_size %u, bi_remaining %d; "
-               "bi_vcnt %d, bi_max_vecs %d, bi_cnt %d, bi_io_vec %p, bi_pool %p\n ",
-               __FILE__, __func__, __LINE__,
-               bio, bio->bi_next, bio->bi_bdev, bio->bi_flags, bio->bi_rw,
-               bio->bi_iter.bi_sector, bio->bi_iter.bi_size, bio->bi_iter.bi_idx, bio->bi_iter.bi_bvec_done,
-               bio->bi_phys_segments, bio->bi_seg_front_size, bio->bi_seg_back_size, atomic_read(&bio->bi_remaining),
-               bio->bi_vcnt, bio->bi_max_vecs, atomic_read(&bio->bi_cnt), bio->bi_io_vec, bio->bi_pool );
-
-    }*/
 
 	if (sdio->submit_io)
 		sdio->submit_io(dio->rw, bio, dio->inode,
@@ -688,7 +820,6 @@ static inline void dio_bio_submit(struct dio *dio, struct dio_submit *sdio)
 	else
 	{
 	    dio_bio_add_to_stripe(dio, bio);
-
 		submit_bio(dio->rw, bio);
 	}
 
@@ -804,9 +935,7 @@ static int dio_bio_complete(struct dio *dio, struct bio *bio)
 			if (dio->rw == READ && !PageCompound(page))
 				set_page_dirty_lock(page);
 			page_cache_release(page);
-            //printk("MikeT: %s %s %d, in for each,  i: %d\n", __FILE__, __func__, __LINE__, i);
 		}
-		//printk("MikeT: %s %s %d, bi_cnt before bio_put: %d\n", __FILE__, __func__, __LINE__, atomic_read(&bio->bi_cnt));
 		bio_put(bio);
 	}
 	return uptodate ? 0 : -EIO;
@@ -822,15 +951,10 @@ static int dio_bio_complete(struct dio *dio, struct bio *bio)
 static void dio_await_completion(struct dio *dio)
 {
 	struct bio *bio;
-	//int num_bio=0;
 	do {
 		bio = dio_await_one(dio);
 		if (bio)
-		{
-            //num_bio++;
-            //printk("MikeT: %s %s %d, num_bio: %d\n", __FILE__, __func__, __LINE__, num_bio);
 			dio_bio_complete(dio, bio);
-        }
 	} while (bio);
 }
 
@@ -852,10 +976,10 @@ static int dio_bio_complete_MikeT(struct dio *dio, struct bio *bio)
 
 	if (dio->is_async && dio->rw == READ) {
 		bio_check_pages_dirty(bio);	/* transfers ownership */
-	} else {
-
+	}
+	else
+    {
 		dio_bio_mark_stripe(dio, bio);
-		//bio_put(bio);
 	}
 	return uptodate ? 0 : -EIO;
 }
@@ -1017,11 +1141,10 @@ static void dio_bio_end_compute(void *bio_reference)
     dsh  = dio_bio_get_stripe(dio, bio);
     dsh->dev_bio[dsh->target]->bi_flags |= 1<<BIO_DIO_COMPLETE;
     bio->bi_flags |= 1<<BIO_DIO_COMPLETE;
+
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
 	dio->bio_list = bio;
-	//if (--dio->refcount == 1 + ignoreR && dio->waiter)
-	//	wake_up_process(dio->waiter);
 	spin_unlock_irqrestore(&dio->bio_lock, flags);
 
 }
@@ -1068,9 +1191,23 @@ static void dio_bio_do_compute5(struct dio *dio, struct bio *bio, struct dio_str
     return ;
 
 }
-static void dio_await_completion_compute_MikeT(struct dio *dio);
-static inline int send_RAID_bio_MikeT(struct dio *dio, struct bio *rbio);
 
+static void dio_bio_schedule_compute(struct dio *dio, struct bio *bio, struct dio_stripe_head *dsh)
+{
+    unsigned long cpu;
+
+    struct r5conf *conf = dsh->conf;
+    struct raid5_percpu *r_percpu = conf->percpu;
+    struct raid5_percpu *percpu;
+    /***reconstruct***/
+    printk("MikeT: %s %s %d, will reconstruct\n", __FILE__, __func__, __LINE__);
+    cpu = get_cpu();
+    percpu = per_cpu_ptr(r_percpu, cpu);
+
+    dio_bio_do_compute5(dio, bio, dsh, conf, percpu);
+
+    put_cpu();
+}
 /**
  * MikeT:
  * The work we need to do when we get the degraded read bio.
@@ -1080,16 +1217,9 @@ static int dio_bio_complete_parity_MikeT(struct dio *dio, struct bio *bio)
 {
 	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
 	struct dio_stripe_head *dsh;
-    if (!dio)
-    {
-        printk("MikeT: %s %s %d, no dio\n", __FILE__, __func__, __LINE__);
-        kfree(bio_data(bio));
-        bio_put(bio);
-        return 0;
-    }
 
     dsh  = dio_bio_get_stripe(dio, bio);
-    if( atomic_read(&dsh->count)==0)
+    if(!test_bit(BIO_NEED_PARITY, &bio->bi_flags))
     {
         printk("MikeT: %s %s %d, slow bio has returned\n", __FILE__, __func__, __LINE__);
         kfree(bio_data(bio));
@@ -1103,29 +1233,14 @@ static int dio_bio_complete_parity_MikeT(struct dio *dio, struct bio *bio)
 	if (dio->is_async && dio->rw == READ) {
 		bio_check_pages_dirty(bio);	/* transfers ownership */
 	} else {
-		unsigned long cpu;
-
-		struct r5conf *conf = dsh->conf;
-		struct raid5_percpu *r_percpu = conf->percpu;
-		struct raid5_percpu *percpu;
-		/***reconstruct***/
-		printk("MikeT: %s %s %d, will reconstruct\n", __FILE__, __func__, __LINE__);
-
-		cpu = get_cpu();
-        percpu = per_cpu_ptr(r_percpu, cpu);
-
-		dio_bio_do_compute5(dio, bio, dsh, conf, percpu);
-
-		put_cpu();
-
-
+	    dio_bio_schedule_compute(dio, bio, dsh);
 	}
 	return uptodate ? 0 : -EIO;
 }
 
 /**
  * MikeT:
- * Work we need to do when we know we finish computing.
+ * Work we need to do when we know we f.inish computing.
  * free the temp page and degraded bio, and add the stripe to dio_sh_list
  */
 static int dio_bio_complete_compute_MikeT(struct dio *dio, struct bio *bio)
@@ -1136,11 +1251,12 @@ static int dio_bio_complete_compute_MikeT(struct dio *dio, struct bio *bio)
 
     kfree(bio_data(bio));
     bio_put(bio);
+
     for(i = 0; i < dsh->disks; i++)
     {
         if(i != dsh->target && i != dsh->pd_idx && dsh->dev_bio[i])
         {
-            if(dsh->dev_bio[i]->bi_iter.bi_sector < dsh->offset || dsh->dev_bio[i]->bi_iter.bi_sector >= dsh->end)
+            if(test_bit(BIO_FREE_DATA, &dsh->dev_bio[i]->bi_flags))
             {
                 kfree(bio_data(dsh->dev_bio[i]));
             }
@@ -1149,11 +1265,13 @@ static int dio_bio_complete_compute_MikeT(struct dio *dio, struct bio *bio)
 
     }
 
+
     if(atomic_dec_return(&dsh->count)<0)
     {
         printk("MikeT: %s %s %d, slow bio has return\n", __FILE__, __func__, __LINE__);
         return 0;
     }
+
     spin_lock_irqsave(&dio->bio_lock, flags);
     dsh->next = dio->dio_sh_list;
     dio->dio_sh_list = dsh;
@@ -1173,9 +1291,9 @@ static int dio_bio_complete_compute_MikeT(struct dio *dio, struct bio *bio)
  *     3) BIO_NEED_PARITY:
  *          meaning degraded read bio returns, call dio_bio_complete_parity_MikeT
  *     4) No both flag:
- *          meaning norma bio returns, call dio_bio_complete_MikeT
+ *          meaning normal bio returns, call dio_bio_complete_MikeT
  */
-static int dio_bio_complete_stripe_head(struct dio *dio, struct bio *bio)
+static int dio_bio_complete_reactive(struct dio *dio, struct bio *bio)
 {
     // per stripe handle
     if(unlikely(test_bit(BIO_DIO_COMPLETE, &bio->bi_flags)&&test_bit(BIO_NEED_PARITY, &bio->bi_flags)))
@@ -1205,6 +1323,23 @@ static int dio_bio_complete_stripe_head(struct dio *dio, struct bio *bio)
     return 0;
 }
 
+static int dio_bio_complete_proactive(struct dio *dio, struct bio *bio)
+{
+    // per stripe handle
+    if(unlikely(test_bit(BIO_DIO_COMPLETE, &bio->bi_flags)&&test_bit(BIO_NEED_PARITY, &bio->bi_flags)))
+    {
+        printk("MikeT: %s %s %d, computation bio returns\n", __FILE__, __func__, __LINE__);
+        //computation bio returns
+        dio_bio_complete_compute_MikeT(dio, bio);
+    }
+    else
+    {
+        printk("MikeT: %s %s %d, normal/parity/slow bio returns\n", __FILE__, __func__, __LINE__);
+        //normal bio returns
+        dio_bio_complete_MikeT(dio, bio);
+    }
+    return 0;
+}
 
 /**
  * MikeT:
@@ -1219,13 +1354,25 @@ static int dio_bio_complete_stripe_head(struct dio *dio, struct bio *bio)
  */
 static int dio_dsh_complete_stripe_head(struct dio *dio, struct dio_stripe_head *dsh)
 {
-    if(atomic_read(&dsh->count)==1)
+    if(readPolicy == 1)
     {
-        send_RAID_bio_MikeT(dio, dsh->dev_bio[dsh->target]);
+        if(atomic_read(&dsh->count)<1)
+        {
+            dio->sh_count--;
+        }
+
     }
-    else if(atomic_read(&dsh->count)<1)
+    else if(readPolicy == 2)
     {
-        dio->sh_count--;
+        if(atomic_read(&dsh->count)==1)
+        {
+            dio_bio_schedule_compute(dio, dsh->dev_bio[dsh->pd_idx], dsh);
+        }
+        else if(atomic_read(&dsh->count)<1)
+        {
+            dio->sh_count--;
+        }
+
     }
     return 0;
 }
@@ -1250,7 +1397,12 @@ static void dio_await_completion_stripe_head(struct dio *dio)
         dsh = NULL;
         bio = dio_await_one_stripe_head(dio);
         if (bio)
-            dio_bio_complete_stripe_head(dio, bio);
+        {
+            if(readPolicy == 1)
+                dio_bio_complete_reactive(dio, bio);
+            else if(readPolicy ==2)
+                dio_bio_complete_proactive(dio, bio);
+        }
 
         spin_lock_irqsave(&dio->bio_lock, flags);
         if (dio->dio_sh_list)
@@ -1278,6 +1430,7 @@ static void dio_await_completion_stripe_head(struct dio *dio)
  * It simply break when there is ingoreR bio remaining
  * It is not used in v2.
  */
+ /*
 static void dio_await_completion_MikeT(struct dio *dio)
 {
 	struct bio *bio;
@@ -1291,12 +1444,13 @@ static void dio_await_completion_MikeT(struct dio *dio)
 	} while (bio);
 
 }
-
+*/
 /**
  * MikeT:
  * a wait function after we submit degraded read bio.
  * not used in v2.
  */
+ /*
 static void dio_await_completion_parity_MikeT(struct dio *dio)
 {
     struct bio *bio;
@@ -1322,6 +1476,7 @@ static void dio_await_completion_parity_MikeT(struct dio *dio)
     }while(bio);
 
 }
+*/
 /**
  * MikeT:
  * make dio wait completion of computing.
@@ -1334,6 +1489,7 @@ static void dio_await_completion_parity_MikeT(struct dio *dio)
  *
  * This function is not used in v2.
  */
+ /*
 static void dio_await_completion_compute_MikeT(struct dio *dio)
 {
     struct bio *bio;
@@ -1356,7 +1512,7 @@ static void dio_await_completion_compute_MikeT(struct dio *dio)
         }
     }while(bio);
 
-}
+}*/
 
 static inline int drop_refcount(struct dio *dio)
 {
@@ -2018,105 +2174,7 @@ next_block:
 out:
 	return ret;
 }
-/**
- * MikeT:
- * This function is used to assemble a bio to do degraded read.
- * We allocate a temp page here, and flag the bio with BIO_NEED_PARITY.
- *
- * This temp page may or may not be used in computation, depending on
- * the order of this bio and slow bio's arrival. It will be later freed.
- */
-static inline int send_RAID_bio_MikeT(struct dio *dio, struct bio *rbio)
-{
-    struct page *page;
-    struct bio *bio;
-    //struct bio_vec *bvec;
-    char *tmp = kmalloc(4096, GFP_KERNEL);
 
-    page = virt_to_page(tmp);
-
-
-    //page = alloc_page(GFP_KERNEL);//rbio->bi_io_vec[0].bv_page;//__get_free_page(__GFP_IO);
-    //page = kmalloc(sizeof(struct page), GFP_USER);
-    //page1 = kmalloc(sizeof(struct page), GFP_KERNEL);
-    //page2 = alloc_page(GFP_KERNEL);
-    //page3 = alloc_page(GFP_USER);
-
-    printk("MikeT: %s %s %d, page %p, tmp:%p\n", __FILE__, __func__, __LINE__,kmap(page),tmp);
-    //memset(page_address(page), 0, PAGE_SIZE);
-    if(IS_ERR(page))
-    {
-            printk("MikeT: %s %s %d, error page\n", __FILE__, __func__, __LINE__);
-            kfree(tmp);
-            return -1;
-    }
-    //page_cache_get(page);
-     /*
-     printk("MikeT: %s %s %d, "
-               "bio %p, bi_next %p, bi_bdev %p, bi_flags %lx, bi_rw %lx; "
-               "bi_iter: bi_sector %u, bi_size %u, bi_idx %u, bi_bvec_done %u; "
-               "bi_phys_segments %u, bi_seg_front_size %u, bi_seg_back_size %u, bi_remaining %d; "
-               "bi_vcnt %d, bi_max_vecs %d, bi_cnt %d, bi_io_vec %p, bi_pool %p\n ",
-               __FILE__, __func__, __LINE__,
-               rbio, rbio->bi_next, rbio->bi_bdev, rbio->bi_flags, rbio->bi_rw,
-               rbio->bi_iter.bi_sector, rbio->bi_iter.bi_size, rbio->bi_iter.bi_idx, rbio->bi_iter.bi_bvec_done,
-               rbio->bi_phys_segments, rbio->bi_seg_front_size, rbio->bi_seg_back_size, atomic_read(&rbio->bi_remaining),
-               rbio->bi_vcnt, rbio->bi_max_vecs, atomic_read(&rbio->bi_cnt), rbio->bi_io_vec, rbio->bi_pool );
-               */
-    printk("MikeT: %s %s %d, get page: %p\n", __FILE__, __func__, __LINE__,page);
-    bio = bio_kmalloc(GFP_KERNEL, 1);
-    //bio_reset(bio);
-    bio->bi_bdev = rbio->bi_bdev;
-    //bio->bi_flags = rbio->bi_flags;
-    bio->bi_rw = READ;
-
-    bio->bi_iter.bi_sector = rbio->bi_iter.bi_sector;
-    bio->bi_iter.bi_size = rbio->bi_iter.bi_size;
-
-    //bio->bi_seg_front_size = rbio->bi_seg_front_size;
-    //bio->bi_seg_back_size = rbio->bi_seg_back_size;
-    bio->bi_private = dio;
-    bio->bi_end_io = dio_bio_end_pio;
-    bio->bi_flags |= 1 << BIO_NEED_PARITY;
-    //bio->need_parity = true;
-
-    //bio_add_page(bio, page, PAGE_SIZE, 0);
-    bio->bi_io_vec[0].bv_page = page;
-    bio->bi_io_vec[0].bv_len = PAGE_SIZE;
-    bio->bi_io_vec[0].bv_offset = 0;
-    //bio->bi_phys_segments++;
-    bio->bi_vcnt++;
-
-    //bvec = &rbio->bi_io_vec[rbio->bi_vcnt];
-
-    //bio_add_page(bio, page, bvec->bv_len, bvec->bv_offset);
-    //bio->bi_flags |= 1<<BIO_SEG_VALID;
-    //printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
-    //kfree(page);
-    //bio_put(bio);
-    //printk("MikeT: %s %s %d, rw: %d, sectoraddr: %llu, sectorsize %d, deviceaddr: %p, rbio addr: %p,  bi_idx: %d,  bi_done %d, bi_vcnt %d\n",
-	//__FILE__,__func__, __LINE__, rbio->bi_rw, (unsigned long long)rbio->bi_iter.bi_sector, rbio->bi_iter.bi_size, rbio->bi_bdev, rbio, rbio->bi_iter.bi_idx, rbio->bi_iter.bi_bvec_done, rbio->bi_vcnt);
-
-    //printk("MikeT: %s %s %d, rw: %d, sectoraddr: %llu, sectorsize %d, deviceaddr: %p, bio addr: %p,  bi_idx: %d,  bi_done %d, bi_vcnt %d\n",
-	//__FILE__,__func__, __LINE__, bio->bi_rw, (unsigned long long)bio->bi_iter.bi_sector, bio->bi_iter.bi_size, bio->bi_bdev, bio, bio->bi_iter.bi_idx, bio->bi_iter.bi_bvec_done, bio->bi_vcnt);
-    dio->refcount++;
-/*
-    printk("MikeT: %s %s %d, "
-               "bio %p, bi_next %p, bi_bdev %p, bi_flags %lx, bi_rw %lx; "
-               "bi_iter: bi_sector %u, bi_size %u, bi_idx %u, bi_bvec_done %u; "
-               "bi_phys_segments %u, bi_seg_front_size %u, bi_seg_back_size %u, bi_remaining %d; "
-               "bi_vcnt %d, bi_max_vecs %d, bi_cnt %d, bi_io_vec %p, bi_pool %p\n ",
-               __FILE__, __func__, __LINE__,
-               bio, bio->bi_next, bio->bi_bdev, bio->bi_flags, bio->bi_rw,
-               bio->bi_iter.bi_sector, bio->bi_iter.bi_size, bio->bi_iter.bi_idx, bio->bi_iter.bi_bvec_done,
-               bio->bi_phys_segments, bio->bi_seg_front_size, bio->bi_seg_back_size, atomic_read(&bio->bi_remaining),
-               bio->bi_vcnt, bio->bi_max_vecs, atomic_read(&bio->bi_cnt), bio->bi_io_vec, bio->bi_pool );
-*/
-    dio_bio_add_to_stripe(dio, bio);
-    submit_bio(dio->rw, bio);
-    //page_cache_release(page);
-    return 0;
-}
 
 /**
  * MikeT:
@@ -2174,7 +2232,7 @@ static inline void init_dio_stripe_head(struct dio *dio, struct block_device *bd
     dio->sh_total = dio->sh_count = ((end - (sh_start << 9)) / STRIPE_SIZE - 1)/ (data_disks) + 1;
     dio->dio_sh = (struct dio_stripe_head *)kmalloc(dio->sh_count * sizeof(struct dio_stripe_head), GFP_KERNEL);
     dio->dio_sh_list = NULL;
-    printk("MikeT: %s %s %d, offset: %d, end: %d\n", __FILE__, __func__, __LINE__, offset, end);
+    printk("MikeT: %s %s %d, offset %lld, end %lld\n", __FILE__, __func__, __LINE__, offset, end);
     for(i = 0; i < dio->sh_count; i++)
     {
         dio->dio_sh[i].conf = conf;
@@ -2209,7 +2267,7 @@ static inline void init_dio_stripe_head(struct dio *dio, struct block_device *bd
         {
             dio->dio_sh[i].full = true;
         }
-        printk("MikeT: %s %s %d, ss: %d, disks: %d, shcount: %d, bio_complete: %lx\n",
+        printk("MikeT: %s %s %d, ss: %lu, disks: %d, shcount: %d, bio_complete: %lx\n",
                 __FILE__, __func__, __LINE__,
                 dio->dio_sh[i].sector, dio->dio_sh[i].disks, atomic_read(&dio->dio_sh[i].count), dio->dio_sh[i].bio_complete_bit);
         //kfree(dio->dio_sh[i].dev_bio);
@@ -2232,7 +2290,7 @@ static void dio_sh_send_more(struct dio *dio, struct dio_stripe_head *dsh)
     int i, d=-1;
     for(i = 0; i < dsh->disks; i++)
     {
-        if(dsh->dev_bio[i] && i == dsh->conf->slow_disk)
+        if(dsh->dev_bio[i] && (i == dsh->conf->slow_disk || dsh->conf->slow_disk == -1))
         {
             d = i;
             break;
@@ -2268,6 +2326,7 @@ static void dio_sh_send_more(struct dio *dio, struct dio_stripe_head *dsh)
 
                 bio->bi_vcnt++;
                 dio->refcount++;
+                bio->bi_flags |= 1<<BIO_FREE_DATA;
                 dio_bio_add_to_stripe(dio, bio);
                 submit_bio(dio->rw, bio);
             }
@@ -2284,6 +2343,78 @@ static void dio_handle_not_full(struct dio *dio)
     if(dio->sh_total > 1 && !dio->dio_sh[dio->sh_total - 1].full)
     {
         dio_sh_send_more(dio, &dio->dio_sh[dio->sh_total - 1]);
+    }
+}
+
+static void dio_sh_send_full(struct dio *dio, struct dio_stripe_head *dsh)
+{
+    int i, nn=-1, d=-1;
+    for(i = 0; i < dsh->disks; i++)
+    {
+        if(dsh->dev_bio[i])
+        {
+            nn = i;
+            if(i == dsh->conf->slow_disk)
+            {
+                d = i;
+            }
+        }
+    }
+    printk("MikeT: %s %s %d, nn: %d, delay one: %d, slow disk: %d\n",__FILE__, __func__, __LINE__, nn, d, dsh->conf->slow_disk);
+    if(nn != -1 && (d != -1 || dsh->conf->slow_disk == -1))
+    {// d!=-1: want to read a slow disk
+     // dsh->conf->slow_disk ==-1: don't know slow disk
+        for( i = 0; i < dsh->disks; i++)
+        {
+            if(!dsh->dev_bio[i])
+            {
+                struct bio *bio;
+                char *tmp = kmalloc(PAGE_SIZE, GFP_KERNEL);
+                struct page *page = virt_to_page(tmp);
+                int dnr = i;
+
+                //printk("MikeT: %s %s %d, get page: %p\n", __FILE__, __func__, __LINE__,page);
+
+                bio = bio_kmalloc(GFP_KERNEL, 1);
+                bio->bi_bdev = dsh->dev_bio[nn]->bi_bdev;
+                bio->bi_rw = READ;
+                bio->bi_flags |= 1 << BIO_FREE_DATA;
+
+                if(i == dsh->pd_idx || i == dsh->qd_idx)
+                {
+                    bio->bi_flags |= 1 << BIO_NEED_PARITY;
+                    bio->bi_iter.bi_sector = dsh->sector;
+                    bio->bi_end_io = dio_bio_end_pio;
+                }
+                else
+                {
+                    raid5_compute_dnr_MikeT(dsh->conf, 0 , &dnr, &dsh->pd_idx, &dsh->qd_idx);
+                    bio->bi_iter.bi_sector = dsh->sector + STRIPE_SECTORS * dnr;
+                    bio->bi_end_io = dio_bio_end_io;
+                }
+                bio->bi_iter.bi_size = PAGE_SIZE;//dsh->dev_bio[d]->bi_iter.bi_size;
+
+                bio->bi_private = dio;
+
+                bio->bi_io_vec[0].bv_page = page;
+                bio->bi_io_vec[0].bv_len = dsh->dev_bio[nn]->bi_iter.bi_size;
+                bio->bi_io_vec[0].bv_offset = 0;
+
+                bio->bi_vcnt++;
+                dio->refcount++;
+                dio_bio_add_to_stripe(dio, bio);
+                submit_bio(dio->rw, bio);
+            }
+        }
+    }
+}
+
+static void dio_send_full(struct dio *dio)
+{
+    int i;
+    for(i = 0; i < dio->sh_total; i++)
+    {
+        dio_sh_send_full(dio, &dio->dio_sh[i]);
     }
 }
 
@@ -2370,7 +2501,7 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
         dio->isRAID = isRaid_(bdev, rw);
     else
         printk("MikeT: %s %s %d, no bdev\n", __FILE__, __func__, __LINE__);
-    printk("MikeT: %s %s %d, count %d\n", __FILE__, __func__, __LINE__, count/PAGE_SIZE);
+    printk("MikeT: %s %s %d, count %lu\n", __FILE__, __func__, __LINE__, count/PAGE_SIZE);
 
 	dio->flags = flags;
 	if (dio->flags & DIO_LOCKING) {
@@ -2496,9 +2627,20 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	{
 	    if(!bdev)
             dio->isRAID = isRaid(sdio.bio, rw);
-        printk("MikeT: %s %s %d, %s\n",__FILE__,__func__,__LINE__, dio->isRAID?"is RAID":"not RAID");
 		dio_bio_submit(dio, &sdio);
     }
+
+    if(dio->isRAID&&readPolicy==1)
+    {//reactive
+        printk("MikeT: %s %s %d, send more, reactive\n",__FILE__,__func__,__LINE__);
+        dio_handle_not_full(dio);
+    }
+    else if(dio->isRAID&&readPolicy==2)
+    {//proactive
+        printk("MikeT: %s %s %d, send more, proactive\n",__FILE__,__func__,__LINE__);
+        dio_send_full(dio);
+    }
+
 	blk_finish_plug(&plug);
 	/*
 	 * It is possible that, we return short IO due to end of file.
@@ -2527,11 +2669,17 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 		retval = -EIOCBQUEUED;
 	else
 	{
-		if(dio->isRAID&&ignoreR!=0)
-		{
-            printk("MikeT: %s %s %d, is RAID\n",__FILE__,__func__,__LINE__);
-            dio_handle_not_full(dio);
+		if(dio->isRAID&&readPolicy==1)
+		{//reactive
+            printk("MikeT: %s %s %d, is RAID, reactive\n",__FILE__,__func__,__LINE__);
+            //dio_handle_not_full(dio);
             /** MikeT: this is a new await function **/
+            dio_await_completion_stripe_head(dio);
+        }
+        else if(dio->isRAID&&readPolicy==2)
+        {//proactive
+            printk("MikeT: %s %s %d, is RAID, proactive\n",__FILE__,__func__,__LINE__);
+            //dio_send_full(dio);
             dio_await_completion_stripe_head(dio);
         }
         else
@@ -2541,40 +2689,16 @@ do_blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
         }
 
     }
-/*
-    if (dio->isRAID && reconRead!=0 && ignoreR!=0)
-    {
-        struct bio_record *head,*next;
-        struct bio *rbio=NULL;
-        head = dio->bio_record;
-        while(head!=NULL)
-        {
-            next = head->next;
-            if(test_bit(BIO_DIO_COMPLETE, &head->bio->bi_flags))
-            {
-                rbio = head->bio;
-                break;
-            }
-            head = next;
-        }
-        if(rbio)
-        {
-            send_RAID_bio_MikeT(dio, rbio);
-            printk("MikeT: %s %s %d, wait parity\n", __FILE__, __func__, __LINE__);
-            dio_await_completion_parity_MikeT(dio);
-            printk("MikeT: %s %s %d, after wait parity\n", __FILE__, __func__, __LINE__);
-        }
-    }*/
     if(dio->isRAID)
         free_dio_stripe_head(dio);
 
-    if (dio->isRAID && ignoreR!=0)
+    if (dio->isRAID && readPolicy!=0)
     {
         printk("MikeT: %s %s %d, drop_refcount: %d, is RAID\n",__FILE__,__func__,__LINE__, drop_refcount(dio));
         retval = dio_complete_MikeT(dio,offset,retval,false);
     }
-    else if ((!dio->isRAID || ignoreR==0) && drop_refcount(dio) == 0 ) {
-        printk("MikeT: %s %s %d, %s\n",__FILE__,__func__,__LINE__, dio->isRAID?"is RAID, ignoreR: 0":"not RAID");
+    else if ((!dio->isRAID || readPolicy==0) && drop_refcount(dio) == 0 ) {
+        printk("MikeT: %s %s %d, %s\n",__FILE__,__func__,__LINE__, dio->isRAID?"is RAID, readPolicy: 0":"not RAID");
 		retval = dio_complete(dio, offset, retval, false);
 	} else
 		BUG_ON(retval != -EIOCBQUEUED);

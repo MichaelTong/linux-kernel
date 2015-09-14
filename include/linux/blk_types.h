@@ -126,6 +126,7 @@ struct bio {
 #define BIO_SNAP_STABLE	10	/* bio data must be snapshotted during write */+
 #define BIO_DIO_COMPLETE 11
 #define BIO_NEED_PARITY 12
+#define BIO_FREE_DATA 14
 
 /*
  * Flags starting here get preserved by bio_reset() - this includes

@@ -16,6 +16,10 @@
 #include <linux/blkdev.h>
 #include <linux/writeback.h>
 
+
+extern int waitCounter;
+extern int enableCount;
+
 static void add_element(mempool_t *pool, void *element)
 {
 	BUG_ON(pool->curr_nr >= pool->min_nr);
@@ -263,6 +267,88 @@ repeat_alloc:
 	goto repeat_alloc;
 }
 EXPORT_SYMBOL(mempool_alloc);
+
+/**
+ * mempool_alloc - allocate an element from a specific memory pool
+ * @pool:      pointer to the memory pool which was allocated via
+ *             mempool_create().
+ * @gfp_mask:  the usual allocation bitmask.
+ *
+ * this function only sleeps if the alloc_fn() function sleeps or
+ * returns NULL. Note that due to preallocation, this function
+ * *never* fails when called from process contexts. (it might
+ * fail if called from an IRQ context.)
+ * Note: using __GFP_ZERO is not supported.
+ */
+void * mempool_alloc_MikeT(mempool_t *pool, gfp_t gfp_mask, bool count)
+{
+	void *element;
+	unsigned long flags;
+	wait_queue_t wait;
+	gfp_t gfp_temp;
+
+	VM_WARN_ON_ONCE(gfp_mask & __GFP_ZERO);
+	might_sleep_if(gfp_mask & __GFP_WAIT);
+
+	gfp_mask |= __GFP_NOMEMALLOC;	/* don't allocate emergency reserves */
+	gfp_mask |= __GFP_NORETRY;	/* don't loop in __alloc_pages */
+	gfp_mask |= __GFP_NOWARN;	/* failures are OK */
+
+	gfp_temp = gfp_mask & ~(__GFP_WAIT|__GFP_IO);
+
+repeat_alloc:
+
+	element = pool->alloc(gfp_temp, pool->pool_data);
+	if (likely(element != NULL))
+		return element;
+
+	spin_lock_irqsave(&pool->lock, flags);
+	if (likely(pool->curr_nr)) {
+		element = remove_element(pool);
+		spin_unlock_irqrestore(&pool->lock, flags);
+		/* paired with rmb in mempool_free(), read comment there */
+		smp_wmb();
+		/*
+		 * Update the allocation stack trace as this is more useful
+		 * for debugging.
+		 */
+		kmemleak_update_trace(element);
+		return element;
+	}
+
+	/*
+	 * We use gfp mask w/o __GFP_WAIT or IO for the first round.  If
+	 * alloc failed with that and @pool was empty, retry immediately.
+	 */
+	if (gfp_temp != gfp_mask) {
+		spin_unlock_irqrestore(&pool->lock, flags);
+		gfp_temp = gfp_mask;
+		goto repeat_alloc;
+	}
+
+	/* We must not sleep if !__GFP_WAIT */
+	if (!(gfp_mask & __GFP_WAIT)) {
+		spin_unlock_irqrestore(&pool->lock, flags);
+		return NULL;
+	}
+    if(count)
+        waitCounter++;
+	/* Let's wait for someone else to return an element to @pool */
+	init_wait(&wait);
+	prepare_to_wait(&pool->wait, &wait, TASK_UNINTERRUPTIBLE);
+
+	spin_unlock_irqrestore(&pool->lock, flags);
+
+	/*
+	 * FIXME: this should be io_schedule().  The timeout is there as a
+	 * workaround for some DM problems in 2.6.18.
+	 */
+	io_schedule_timeout(5*HZ);
+
+	finish_wait(&pool->wait, &wait);
+	goto repeat_alloc;
+}
+EXPORT_SYMBOL(mempool_alloc_MikeT);
 
 /**
  * mempool_free - return an element to the pool.

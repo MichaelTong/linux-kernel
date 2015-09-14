@@ -401,7 +401,7 @@ struct r5conf {
 	int			raid_disks;
 	int			max_nr_stripes;
 	int         slow_disk; //MikeT: added
-
+    int         *slow_cnt;
 	/* reshape_progress is the leading edge of a 'reshape'
 	 * It has value MaxSector when no reshape is happening
 	 * If delta_disks < 0, it is the last sector we started work on,
@@ -565,4 +565,5 @@ extern int raid5_set_cache_size(struct mddev *mddev, int size);
 extern sector_t raid5_compute_sector_MikeT(struct r5conf *conf, sector_t r_sector,
                                            int previous, int *dd_idx, int *pd, int *qd, int *ddf);
 extern void raid5_compute_dnr_MikeT(struct r5conf *conf, int previous, int *dd_idx, int *pd, int *qd);
+extern void raid5_record_slow(struct r5conf *conf, int d_idx);
 #endif

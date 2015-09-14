@@ -89,7 +89,21 @@ static struct workqueue_struct *raid5_wq;
 #define HASH_MASK		(NR_HASH - 1)
 #define MAX_STRIPE_BATCH	8
 
-static void printk_request_fn_name(struct bio *bi);
+//static void printk_request_fn_name(struct bio *bi);
+
+void raid5_record_slow(struct r5conf *conf, int d_idx)
+{
+    conf->slow_cnt[d_idx]++;
+    if(conf->slow_disk == -1 || conf->slow_cnt[d_idx] > conf->slow_cnt[conf->slow_disk] + 2)
+    {
+        conf->slow_disk = d_idx;
+    }
+    if(conf->slow_cnt[conf->slow_disk] > 1000)
+    {//reset
+        memset(conf->slow_cnt, 0, conf->raid_disks*sizeof(int));
+        conf->slow_disk = -1;
+    }
+}
 
 static inline struct hlist_head *stripe_hash(struct r5conf *conf, sector_t sect)
 {
@@ -2850,7 +2864,7 @@ sector_t raid5_compute_sector_MikeT(struct r5conf *conf, sector_t r_sector,
 
 void raid5_compute_dnr_MikeT(struct r5conf *conf, int previous, int *dd_idx, int *pd, int *qd)
 {
-    int pd_idx=*pd, qd_idx=*qd;
+    int pd_idx=*pd;
     int algorithm = previous ? conf->prev_algo
                     : conf->algorithm;
     int raid_disks = previous ? conf->previous_raid_disks
@@ -5225,14 +5239,16 @@ static void raid5_parity_endio(struct bio *bi, int error)
 
     if(!error && uptodate)
     {
-        //trace_block_bio_complete(bdev_get_queue(raid_bi->bi_bdev), raid_bi, 0);
-        if(test_bit(BIO_NEED_PARITY, &raid_bi->bi_flags))
-            bio_endio(raid_bi, 0);
-        else
+
+        if(!test_bit(BIO_NEED_PARITY, &raid_bi->bi_flags))
         {
+            printk("MikeT: %s %s %d, do not need this parity\n", __FILE__, __func__, __LINE__);
             kfree(bio_data(raid_bi));
             bio_put(raid_bi);
+            return;
         }
+        else
+            bio_endio(raid_bi, 0);
         //bio_endio(raid_bi,0);
         if(atomic_dec_and_test(&conf->active_aligned_reads))
             wake_up(&conf->wait_for_stripe);
@@ -5275,15 +5291,9 @@ static void raid5_align_endio(struct bio *bi, int error)
         if(test_bit(BIO_DIO_COMPLETE, &raid_bi->bi_flags))
         {
             printk("MikeT: %s %s %d, dio already completed\n", __FILE__, __func__, __LINE__);
-            //bio_for_each_segment_all(bvec, raid_bi, i) {
-            //    struct page *page = bvec->bv_page;
-
-            //    if (raid_bi->rw==READ&&!PageCompound(page))
-            //        set_page_dirty_lock(page);
-            //    page_cache_release(page);
-			//}
-			bio_put(raid_bi);
-			//bio_endio(raid_bi, 0);
+			if(test_bit(BIO_FREE_DATA, &raid_bi->bi_flags))
+                kfree(bio_data(raid_bi));
+            bio_put(raid_bi);
         }
         else
         {
@@ -5434,9 +5444,9 @@ static int chunk_aligned_read(struct mddev *mddev, struct bio * raid_bio)
         //printk("MikeT: %s %s %d, bio flags %lx\n", __FILE__, __func__, __LINE__, align_bi->bi_flags);
         printk("MikeT: %s %s %d, "
                "bio %p, bi_next %p, bi_bdev %p, bi_flags %lx, bi_rw %lx; "
-               "bi_iter: bi_sector %u, bi_size %u, bi_idx %u, bi_bvec_done %u; "
+               "bi_iter: bi_sector %lu, bi_size %u, bi_idx %u, bi_bvec_done %u; "
                "bi_phys_segments %u, bi_seg_front_size %u, bi_seg_back_size %u, bi_remaining %d; "
-               "bi_vcnt %d, bi_max_vecs %d, bi_cnt %d, bi_io_vec %p, bi_pool %p\n ",
+               "bi_vcnt %u, bi_max_vecs %d, bi_cnt %d, bi_io_vec %p, bi_pool %p\n ",
                __FILE__, __func__, __LINE__,
                align_bi, align_bi->bi_next, align_bi->bi_bdev, align_bi->bi_flags, align_bi->bi_rw,
                align_bi->bi_iter.bi_sector, align_bi->bi_iter.bi_size, align_bi->bi_iter.bi_idx, align_bi->bi_iter.bi_bvec_done,
@@ -5748,6 +5758,7 @@ again:
  * MikeT:
  * Get disk number from bio
  */
+ /*
 static int getDiskNrMikeT(struct mddev *mddev, struct bio *bi)
 {
     struct r5conf *conf = mddev->private;
@@ -5757,8 +5768,8 @@ static int getDiskNrMikeT(struct mddev *mddev, struct bio *bi)
     printk("MikeT: %s %s %d, bi: %p, dd_idx %d\n", __FILE__,__func__, __LINE__, bi, dd_idx);
 
     return dd_idx;
-}
-
+}*/
+/*
 static void printk_request_fn_name(struct bio *bi)
 {
     struct request_queue *q = bdev_get_queue(bi->bi_bdev);
@@ -5769,7 +5780,7 @@ static void printk_request_fn_name(struct bio *bi)
     name = kallsyms_lookup((unsigned long)(q->make_request_fn), &kasize, &kaoffset, &modname, namebuff);
     printk("MikeT: %s %s %d, %s\n",__FILE__,__func__,__LINE__, name);
 }
-
+*/
 /**
  * MikeT:
  * Read parity function.
@@ -7113,6 +7124,7 @@ static void free_conf(struct r5conf *conf)
     free_thread_groups(conf);
     shrink_stripes(conf);
     raid5_free_percpu(conf);
+    kfree(conf->slow_cnt);
     kfree(conf->disks);
     kfree(conf->stripe_hashtbl);
     kfree(conf);
@@ -7353,6 +7365,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
         printk(KERN_INFO "md/raid:%s: allocated %dkB\n",
                mdname(mddev), memory);
     conf->slow_disk = -1;//MikeT: added
+    conf->slow_cnt = (int *)kzalloc(conf->raid_disks*sizeof(int), GFP_KERNEL);
     sprintf(pers_name, "raid%d", mddev->new_level);
     conf->thread = md_register_thread(raid5d, mddev, pers_name);
     printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->thread);

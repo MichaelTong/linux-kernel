@@ -650,7 +650,7 @@ static inline struct bio *bio_list_get(struct bio_list *bl)
  * allocate their own private memory pools for bio and iovec structures.
  * These memory pools in turn all allocate from the bio_slab
  * and the bvec_slabs[].
- */
+ *///MikeT 2 6
 #define BIO_POOL_SIZE 2
 #define BIOVEC_NR_POOLS 6
 #define BIOVEC_MAX_IDX	(BIOVEC_NR_POOLS - 1)

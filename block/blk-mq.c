@@ -558,7 +558,7 @@ void blk_mq_rq_timed_out(struct request *req, bool reserved)
 		break;
 	}
 }
-		
+
 static void blk_mq_check_expired(struct blk_mq_hw_ctx *hctx,
 		struct request *rq, void *priv, bool reserved)
 {
@@ -1244,6 +1244,7 @@ static void blk_sq_make_request(struct request_queue *q, struct bio *bio)
 	 * utilize that to temporarily store requests until the task is
 	 * either done or scheduled away.
 	 */
+	 printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
 	if (use_plug) {
 		struct blk_plug *plug = current->plug;
 
@@ -1252,6 +1253,7 @@ static void blk_sq_make_request(struct request_queue *q, struct bio *bio)
 			if (list_empty(&plug->mq_list))
 				trace_block_plug(q);
 			else if (request_count >= BLK_MAX_REQUEST_COUNT) {
+                printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);
 				blk_flush_plug_list(plug, false);
 				trace_block_plug(q);
 			}

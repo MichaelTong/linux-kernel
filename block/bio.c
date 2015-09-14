@@ -55,6 +55,8 @@ static struct biovec_slab bvec_slabs[BIOVEC_NR_POOLS] __read_mostly = {
  */
 struct bio_set *fs_bio_set;
 EXPORT_SYMBOL(fs_bio_set);
+extern int waitCounter;
+extern int enableCount;
 
 /*
  * Our slab pool management
@@ -455,7 +457,7 @@ struct bio *bio_alloc_bioset(gfp_t gfp_mask, int nr_iovecs, struct bio_set *bs)
 		if (current->bio_list && !bio_list_empty(current->bio_list))
 			gfp_mask &= ~__GFP_WAIT;
 
-		p = mempool_alloc(bs->bio_pool, gfp_mask);
+		p = mempool_alloc_MikeT(bs->bio_pool, gfp_mask, bs==fs_bio_set && enableCount);
 		if (!p && gfp_mask != saved_gfp) {
 			punt_bios_to_rescuer(bs);
 			gfp_mask = saved_gfp;
