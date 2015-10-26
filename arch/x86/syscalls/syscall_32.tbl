@@ -368,3 +368,4 @@
 359     i386	changeIgnoreR           sys_changeIgnoreR
 360	i386	changeReadPolicy	sys_changeReadPolicy
 361	i386	changeEnableCount	sys_changeEnableCount
+362	i386	changeDebuginfo		sys_changeDebuginfo

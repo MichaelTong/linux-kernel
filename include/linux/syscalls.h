@@ -881,4 +881,5 @@ asmlinkage void sys_changeIgnoreK(int newval);
 asmlinkage void sys_changeIgnoreR(int newval);
 asmlinkage void sys_changeReadPolicy(int newval);
 asmlinkage void sys_changeEnableCount(int newval);
+asmlinkage void sys_changeDebuginfo(int bit, bool on);
 #endif

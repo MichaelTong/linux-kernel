@@ -3,6 +3,7 @@
 
 #include <linux/raid/xor.h>
 #include <linux/dmaengine.h>
+#include <linux/time.h>
 
 /*
  *
@@ -300,6 +301,7 @@ enum r5dev_flags {
 			 */
 	R5_Discard,	/* Discard the stripe */
 	R5_SkipCopy,	/* Don't copy data from bio to stripe cache */
+	R5_Complete,
 };
 
 /*
@@ -400,8 +402,10 @@ struct r5conf {
 	int			max_degraded;
 	int			raid_disks;
 	int			max_nr_stripes;
+
 	int         slow_disk; //MikeT: added
     int         *slow_cnt;
+    int         bio_count;
 	/* reshape_progress is the leading edge of a 'reshape'
 	 * It has value MaxSector when no reshape is happening
 	 * If delta_disks < 0, it is the last sector we started work on,

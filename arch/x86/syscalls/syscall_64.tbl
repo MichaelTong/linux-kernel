@@ -332,6 +332,7 @@
 323	common	changeIgnoreR		sys_changeIgnoreR
 324	common	changeReadPolicy	sys_changeReadPolicy
 325	common	changeEnableCount	sys_changeEnableCount
+326	common	changeDebuginfo		sys_changeDebuginfo
 #
 # x32-specific system call numbers start at 512 to avoid cache impact
 # for native 64-bit operation.

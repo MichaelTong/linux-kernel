@@ -15,6 +15,9 @@ EXPORT_SYMBOL(waitCounter);
 int enableCount = 0;
 EXPORT_SYMBOL(enableCount);
 
+long unsigned debuginfo = 0x3;
+EXPORT_SYMBOL(debuginfo);
+
 
 asmlinkage void sys_changeIgnoreK(int newval){
 	ignoreK = newval;
@@ -63,3 +66,17 @@ asmlinkage void sys_changeEnableCount(int newval){
 	}
 }
 
+asmlinkage void sys_changeDebuginfo(int bit, bool on)
+{
+	if(on)
+	{
+		debuginfo |= 1 << bit;
+		printk("Debug Info bit %d, on\n", bit);
+	}
+	else
+	{
+		long unsigned uf = 0xffffffff;
+		uf ^= 1 << bit;
+		debuginfo &= uf;
+	}
+}

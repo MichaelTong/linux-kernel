@@ -39,7 +39,6 @@
 #include "blk.h"
 #include "blk-cgroup.h"
 #include "blk-mq.h"
-
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_remap);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_remap);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_complete);
@@ -47,7 +46,23 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(block_split);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_unplug);
 
 DEFINE_IDA(blk_queue_ida);
+extern ktime_t t1,t2,t3,t4,t5;
+extern int readPolicy;
 
+//static inline bool isRaids(struct bio *bi)
+//{
+//    struct request_queue *q = bdev_get_queue(bi->bi_bdev);
+//    char *modname=NULL;
+//    const char *name =NULL;
+ //   unsigned long kaoffset, kasize;
+//    char namebuff[500];
+ //   name = kallsyms_lookup((unsigned long)(q->make_request_fn), &kasize, &kaoffset, &modname, namebuff);
+   //printk("MikeT: %s %s %d, %s\n",__FILE__,__func__,__LINE__, name);
+ //   if(strcmp(name, "md_make_request")==0)
+ //       return true;
+ //   else
+ //       return false;
+//}
 /*
  * For the allocated request tables
  */
@@ -1553,6 +1568,8 @@ void blk_queue_bio(struct request_queue *q, struct bio *bio)
 	struct request *req;
 	unsigned int request_count = 0;
 
+	ktime_t t31, t32;
+
 	/*
 	 * low level driver can indicate that it wants pages above a
 	 * certain limit bounced to low memory (ie for highmem, or even
@@ -1612,7 +1629,14 @@ get_rq:
 	 * Grab a free request. This is might sleep but can not fail.
 	 * Returns with the queue unlocked.
 	 */
+    t31 = ktime_get();
 	req = get_request(q, rw_flags, bio, GFP_NOIO);
+	t32 = ktime_get();
+	if(readPolicy)
+    {
+        //printk("MikeT: %s %s %d, t31 %lld, t32 %lld\n ", __FILE__, __func__, __LINE__, ktime_to_ns(t31), ktime_to_ns(t32));
+        t3 = ktime_add(t3, ktime_sub(t32, t31));
+    }
 	if (IS_ERR(req)) {
 		bio_endio(bio, PTR_ERR(req));	/* @q is dead */
 		goto out_unlock;
@@ -1873,6 +1897,8 @@ end_io:
 void generic_make_request(struct bio *bio)
 {
 	struct bio_list bio_list_on_stack;
+    //bool re = isRaids(bio);
+    //ktime_t ta,taa,tb,tbb,tc,tcc,td,tdd;
 
 	if (!generic_make_request_checks(bio))
 		return;
@@ -1908,13 +1934,24 @@ void generic_make_request(struct bio *bio)
 	BUG_ON(bio->bi_next);
 	bio_list_init(&bio_list_on_stack);
 	current->bio_list = &bio_list_on_stack;
+	//ta = ktime_get();
 	do {
 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+		//bool isR = isRaids(bio);
         //if(bio->need_parity) {printk("MikeT: %s %s %d\n", __FILE__, __func__, __LINE__);}
+        //tb = ktime_get();
 		q->make_request_fn(q, bio);
-
+		//tbb = ktime_get();
+		//if(re && isR && readPolicy)
+        //    t4 = ktime_add(t4, ktime_sub(tbb, tb));
+        //else if(re && readPolicy)
+        //    t5 = ktime_add(t5, ktime_sub(tbb, tb));
 		bio = bio_list_pop(current->bio_list);
+
 	} while (bio);
+	//taa = ktime_get();
+	//if(re && readPolicy)
+    //    t3 = ktime_add(t3, ktime_sub(taa, ta));
 	current->bio_list = NULL; /* deactivate */
 }
 EXPORT_SYMBOL(generic_make_request);

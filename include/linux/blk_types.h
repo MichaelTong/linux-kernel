@@ -6,6 +6,7 @@
 #define __LINUX_BLK_TYPES_H
 
 #include <linux/types.h>
+#include <linux/ktime.h>
 
 struct bio_set;
 struct bio;
@@ -48,6 +49,8 @@ struct bio {
 	struct block_device	*bi_bdev;
 	//bool dio_comp;
 	//bool need_parity;
+	atomic_t *raidref;
+	ktime_t *raidfin;
 	unsigned long		bi_flags;	/* status, command, etc */
 	unsigned long		bi_rw;		/* bottom bits READ/WRITE,
 						 * top bits priority
@@ -127,6 +130,7 @@ struct bio {
 #define BIO_DIO_COMPLETE 11
 #define BIO_NEED_PARITY 12
 #define BIO_FREE_DATA 14
+#define BIO_DONT_SEND 15
 
 /*
  * Flags starting here get preserved by bio_reset() - this includes
