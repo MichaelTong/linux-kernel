@@ -15,7 +15,7 @@ EXPORT_SYMBOL(waitCounter);
 int enableCount = 0;
 EXPORT_SYMBOL(enableCount);
 
-long unsigned debuginfo = 0x3;
+long unsigned debuginfo = 0;
 EXPORT_SYMBOL(debuginfo);
 
 
@@ -62,7 +62,7 @@ asmlinkage void sys_changeEnableCount(int newval){
 	{
 		enableCount = 0;
 		printk("Disable wait counter, previous value of counter is %d\n", waitCounter);
-		waitCounter = 0;	
+		waitCounter = 0;
 	}
 }
 

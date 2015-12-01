@@ -57,6 +57,7 @@
 #include <trace/events/block.h>
 #include <linux/kallsyms.h>
 #include <linux/bio.h>
+#include "../block/blk-cgroup.h"
 
 #include "md.h"
 #include "raid5.h"
@@ -93,28 +94,125 @@ static struct workqueue_struct *raid5_wq;
 #define RESET               1000
 
 //static void printk_request_fn_name(struct bio *bi);
+void raid5_measure(struct r5conf *conf);
 void raid5_record_reset(struct r5conf *conf)
 {
     memset(conf->slow_cnt, 0,conf->raid_disks*sizeof(int));
     conf->slow_disk = -1;
 }
 
-void raid5_record_slow(struct r5conf *conf, int d_idx)
+void raid5_bio_queue_size(struct bio *bio, int d_idx)
 {
-    conf->slow_cnt[d_idx]++;
-    if((conf->slow_disk == -1 && conf->slow_cnt[d_idx] > DIFF)|| (conf->slow_cnt[d_idx] > conf->slow_cnt[conf->slow_disk] + DIFF))
+    struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+    struct request_list *rl = blk_get_rl(q,bio);
+    if(debuginfo & (1 << 7))
+        printk("MikeT: RAID disk %d, queue: %d %d %d %d\n", d_idx, rl->count[0], rl->count[1], rl->starved[0], rl->starved[1] );
+    //bio->sendt = ktime_get();
+    //bio->idx = d_idx;
+}
+
+void raid5_record_slow_by(struct r5conf *conf, int d_idx, int by)
+{
+    conf->slow_cnt[d_idx]+=by;
+    if(debuginfo & (1<<6))
+        printk("MikeT: slow %d\n", d_idx);
+    if((conf->slow_disk == -1 && conf->slow_cnt[d_idx] > 80)|| (conf->slow_cnt[d_idx] > conf->slow_cnt[conf->slow_disk] + 80))
     {
         conf->slow_disk = d_idx;
     }
-    if(conf->slow_cnt[conf->slow_disk] > 1000)
+    if(conf->slow_cnt[conf->slow_disk] > 2000)
     {//reset
         raid5_record_reset(conf);
+    }
+}
+
+void raid5_record_slow(struct r5conf *conf, int d_idx)
+{
+    raid5_record_slow_by(conf, d_idx, 1);
+}
+
+void raid5_measure(struct r5conf *conf)
+{
+	int i;
+	int cpu;
+	unsigned long long sector_read, sector_write, weighted_time;
+	unsigned long long mint=1, maxt=2;
+	int mini = -1, maxi = -1;
+	struct hd_struct *hd;
+	ktime_t cur = ktime_get();
+	bool restart;
+	unsigned long long interval = ktime_to_ns(ktime_sub(cur, conf->sample_time));
+
+	if(interval > 2000000000)
+        restart = true;
+    else
+        restart = false;
+    conf->sample_time = cur;
+    for(i = 0; interval!=0 && i < conf->raid_disks; i++)
+    {
+        hd = conf->disks[i].rdev->bdev->bd_part;
+        if(!hd)
+            continue;
+        cpu = part_stat_lock();
+        part_round_stats(cpu, hd);
+        part_stat_unlock();
+        sector_read = part_stat_read(hd, sectors[READ]) - conf->sector_read[i];
+        conf->sector_read[i] = part_stat_read(hd, sectors[READ]);
+        sector_write = part_stat_read(hd, sectors[WRITE]) - conf->sector_write[i];
+        conf->sector_write[i] = part_stat_read(hd, sectors[WRITE]);
+        weighted_time = jiffies_to_msecs(part_stat_read(hd, time_in_queue)) - conf->weighted_time[i];
+        conf->weighted_time[i] = jiffies_to_msecs(part_stat_read(hd, time_in_queue));
+        if(restart)
+            raid5_record_reset(conf);
+        else
+        {
+            if((mini == -1 || weighted_time < mint))
+            {
+                mini = i;
+                mint = weighted_time;
+            }
+            if((maxi == -1 || weighted_time > maxt))
+            {
+                maxi = i;
+                maxt = weighted_time;
+            }
+        }
+		if(debuginfo & ( 1 << 5))
+		{
+			printk("MikeT: RAID Disk %d, read: %llu KB/s, write: %llu KB/s, avgqu-sz: %llu/100\n", i, (sector_read>>1)*1000000000/interval, (sector_write>>1)*1000000000/interval, weighted_time*100000000/interval);
+		}
+	}
+    hd = &conf->mddev->gendisk->part0;
+    cpu = part_stat_lock();
+    part_round_stats(cpu, hd);
+    part_stat_unlock();
+    sector_read = part_stat_read(hd, sectors[READ]) - conf->sector_read[i];
+    conf->sector_read[i] = part_stat_read(hd, sectors[READ]);
+    sector_write = part_stat_read(hd, sectors[WRITE]) - conf->sector_write[i];
+    conf->sector_write[i] = part_stat_read(hd, sectors[WRITE]);
+    weighted_time = jiffies_to_msecs(part_stat_read(hd, time_in_queue)) - conf->weighted_time[i];
+    conf->weighted_time[i] = jiffies_to_msecs(part_stat_read(hd, time_in_queue));
+    if(debuginfo & ( 1 << 5))
+    {
+        printk("MikeT: RAID, read: %llu KB/s, write: %llu KB/s, avgqu-sz: %llu/100\n", (sector_read>>1)*1000000000/interval, (sector_write>>1)*1000000000/interval, weighted_time*100000000/interval);
+    }
+    if(interval!=0 && !restart && (maxt-mint)*100000000/interval>200)
+    {
+        raid5_record_slow_by(conf, maxi, conf->raid_disks*40/(conf->raid_disks - conf->max_degraded));
     }
 }
 
 void raid5_bio_inc(struct r5conf *conf)
 {
     conf->bio_count++;
+    if(conf->bio_count%40==0)
+    {
+        //raid5_measure(conf);
+    }
+    if( conf->bio_count >= 2*conf->raid_disks)
+    {
+        md_wakeup_thread(conf->clean_thread);
+    }
     if(conf->bio_count > (conf->raid_disks - conf->max_degraded)*RESET)
     {
         raid5_record_reset(conf);
@@ -5407,7 +5505,8 @@ static void raid5_parity_endio(struct bio *bi, int error)
 
     if(!error && uptodate)
     {
-
+        if(!raid_bi)
+            return;
         if(!test_bit(BIO_NEED_PARITY, &raid_bi->bi_flags))
         {
             if(debuginfo & ( 1 << 2)) printk("MikeT: %s %s %d, do not need this parity\n", __FILE__, __func__, __LINE__);
@@ -5441,7 +5540,6 @@ static void raid5_align_endio(struct bio *bi, int error)
     struct md_rdev *rdev;
     //struct bio_vec *bvec;
 	//unsigned i;
-
     bio_put(bi);
 
     rdev = (void*)raid_bi->bi_next;
@@ -5455,7 +5553,8 @@ static void raid5_align_endio(struct bio *bi, int error)
     {
         //MikeT-star-read
         if(debuginfo & ( 1 << 2)) printk("MikeT: %s %s %d, bio %p, no error and uptodate, uptodate %d,sectoraddr %llu, sectorsize %d, deviceaddr %p\n", __FILE__,__func__, __LINE__,raid_bi,uptodate,(unsigned long long)raid_bi->bi_iter.bi_sector,raid_bi->bi_iter.bi_size, raid_bi->bi_bdev);
-
+        if(!raid_bi)
+            return;
         if(test_bit(BIO_DIO_COMPLETE, &raid_bi->bi_flags))
         {
             if(debuginfo & ( 1 << 2)) printk("MikeT: %s %s %d, dio already completed\n", __FILE__, __func__, __LINE__);
@@ -5624,6 +5723,7 @@ static int chunk_aligned_read(struct mddev *mddev, struct bio * raid_bio)
         if(!test_bit(BIO_DIO_COMPLETE, &raid_bio->bi_flags))
         {
             //ts = ktime_get();
+            raid5_bio_queue_size(align_bi, dd_idx);
             generic_make_request(align_bi);
             //te = ktime_get();
             //if(dd_idx == 1 && readPolicy)
@@ -6069,6 +6169,7 @@ static int read_parity(struct mddev *mddev, struct bio *raid_bi)
                align_bi->bi_vcnt, align_bi->bi_max_vecs, atomic_read(&align_bi->bi_cnt), align_bi->bi_io_vec, align_bi->bi_pool );*/
         //printk_request_fn_name(raid_bi);
         //ts = ktime_get();
+        raid5_bio_queue_size(align_bi, pd_idx);
         generic_make_request(align_bi);
         //te = ktime_get();
         //if(pd_idx==1 && readPolicy)
@@ -6123,14 +6224,16 @@ static void make_request(struct mddev *mddev, struct bio * bi)
             mddev->reshape_position == MaxSector &&
             chunk_aligned_read(mddev,bi))
     {
-        if(debuginfo & ( 1 << 2)) printk("MikeT: make_request, return if read\n");
+        if(debuginfo & ( 1 << 2))
+            printk("MikeT: make_request, return if read\n");
         return;
     }
 
     if (unlikely(bi->bi_rw & REQ_DISCARD))
     {
         make_discard_request(mddev, bi);
-        if(debuginfo & ( 1 << 2)) printk("MikeT: make_request, discard request\n");
+        if(debuginfo & ( 1 << 2))
+            printk("MikeT: make_request, discard request\n");
         return;
     }
 
@@ -6861,6 +6964,71 @@ static void raid5_do_work(struct work_struct *work)
     pr_debug("--- raid5worker inactive\n");
 }
 
+void enqueue_clean_list(struct bio *bio, struct r5conf *conf)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&conf->clean_lock, flags);
+    if(conf->clean_head == NULL)
+        conf->clean_head = bio;
+    else
+        conf->clean_tail->bi_next = bio;
+    bio->bi_next = NULL;
+    conf->clean_tail = bio;
+    spin_unlock_irqrestore(&conf->clean_lock, flags);
+}
+struct bio* unqueue_clean_list(struct r5conf *conf)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&conf->clean_lock, flags);
+    if(conf->clean_head == NULL)
+    {
+        spin_unlock_irqrestore(&conf->clean_lock, flags);
+        return NULL;
+    }
+    else
+    {
+        struct bio *bi = conf->clean_head;
+        conf->clean_head = conf->clean_head->bi_next;
+        bi->bi_next = NULL;
+        spin_unlock_irqrestore(&conf->clean_lock, flags);
+        return bi;
+    }
+}
+
+static void raid5_bio_cleanup(struct md_thread *thread)
+{
+
+    struct mddev *mddev = thread->mddev;
+    struct r5conf *conf = mddev->private;
+    unsigned long flags;
+    struct bio* tail, *to_b;
+    bool finish;
+    return;
+
+    spin_lock_irqsave(&conf->clean_lock, flags);
+    tail = conf->clean_tail;
+    spin_unlock_irqrestore(&conf->clean_lock, flags);
+
+    while((to_b = unqueue_clean_list(conf))!=NULL)
+    {
+        if(to_b == tail)
+            finish = true;
+        if(to_b->raidref == NULL)
+        {
+            printk("MikeT: %s %s %d, bio cleanup %p\n", __FILE__, __func__, __LINE__, to_b);
+            if(test_bit(BIO_FREE_DATA, &to_b->bi_flags))
+                kfree(bio_data(to_b));
+            bio_put(to_b);
+        }
+        else
+            enqueue_clean_list(to_b, conf);
+        if(finish)
+            break;
+    }
+
+}
+
+
 /*
  * This is our raid5 kernel thread.
  *
@@ -7315,6 +7483,9 @@ static void free_conf(struct r5conf *conf)
     shrink_stripes(conf);
     raid5_free_percpu(conf);
     kfree(conf->slow_cnt);
+    kfree(conf->sector_read);
+    kfree(conf->sector_write);
+    kfree(conf->weighted_time);
     kfree(conf->disks);
     kfree(conf->stripe_hashtbl);
     kfree(conf);
@@ -7556,10 +7727,14 @@ static struct r5conf *setup_conf(struct mddev *mddev)
                mdname(mddev), memory);
     conf->slow_disk = -1;//MikeT: added
     conf->bio_count = 0;
+    conf->sample_time = ktime_get();
     conf->slow_cnt = (int *)kzalloc(conf->raid_disks*sizeof(int), GFP_KERNEL);
+    conf->sector_read = (int *)kzalloc((conf->raid_disks+1)*sizeof(int), GFP_KERNEL);
+    conf->sector_write = (int *)kzalloc((conf->raid_disks+1)*sizeof(int), GFP_KERNEL);
+    conf->weighted_time = (int *)kzalloc((conf->raid_disks+1)*sizeof(int), GFP_KERNEL);
     sprintf(pers_name, "raid%d", mddev->new_level);
     conf->thread = md_register_thread(raid5d, mddev, pers_name);
-    if(debuginfo & ( 1 << 2)) printk("MikeT: %s %s %d, thread %p\n", __FILE__, __func__, __LINE__, conf->thread);
+    conf->clean_thread = md_register_thread(raid5_bio_cleanup, mddev, pers_name);
     if (!conf->thread)
     {
         printk(KERN_ERR
@@ -7567,6 +7742,16 @@ static struct r5conf *setup_conf(struct mddev *mddev)
                mdname(mddev));
         goto abort;
     }
+    if (!conf->clean_thread)
+    {
+        printk(KERN_ERR
+               "md/raid:%s: couldn't allocate clean thread.\n",
+               mdname(mddev));
+        goto abort;
+    }
+    spin_lock_init(&conf->clean_lock);
+    conf->clean_head = NULL;
+    conf->clean_tail = NULL;
 
     return conf;
 
@@ -7971,6 +8156,7 @@ static int run(struct mddev *mddev)
     return 0;
 abort:
     md_unregister_thread(&mddev->thread);
+    md_unregister_thread(&conf->clean_thread);
     print_raid5_conf(conf);
     free_conf(conf);
     mddev->private = NULL;

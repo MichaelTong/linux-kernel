@@ -1323,7 +1323,7 @@ static void __map_bio(struct dm_target_io *tio)
 
 		trace_block_bio_remap(bdev_get_queue(clone->bi_bdev), clone,
 				      tio->io->bio->bi_bdev->bd_dev, sector);
-        printk("MikeT: %s %s %d\n",  __FILE__,__func__, __LINE__);
+        //printk("MikeT: %s %s %d\n",  __FILE__,__func__, __LINE__);
 
 		generic_make_request(clone);
 	} else if (r < 0 || r == DM_MAPIO_REQUEUE) {

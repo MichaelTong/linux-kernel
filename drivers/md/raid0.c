@@ -532,9 +532,11 @@ static void raid0_make_request(struct mddev *mddev, struct bio *bio)
 			 : sector_div(sector, chunk_sects));
 
 		if (sectors < bio_sectors(bio)) {
+            printk("MikeT: %s %s %d, split\n",__FILE__,__func__,__LINE__);
 			split = bio_split(bio, sectors, GFP_NOIO, fs_bio_set);
 			bio_chain(split, bio);
 		} else {
+            printk("MikeT: %s %s %d, no split\n",__FILE__,__func__,__LINE__);
 			split = bio;
 		}
 
@@ -549,7 +551,10 @@ static void raid0_make_request(struct mddev *mddev, struct bio *bio)
 			/* Just ignore it */
 			bio_endio(split, 0);
 		} else
+		{
+            split->b1 = ktime_get();
 			generic_make_request(split);
+        }
 	} while (split != bio);
 }
 

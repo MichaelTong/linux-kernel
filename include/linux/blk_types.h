@@ -50,7 +50,13 @@ struct bio {
 	//bool dio_comp;
 	//bool need_parity;
 	atomic_t *raidref;
+	int cur_remaining; /*in raid, when this bio finishes, how many remains in the stripe*/
 	ktime_t *raidfin;
+	spinlock_t *bi_lock;
+	ktime_t b1,b2;
+	ktime_t e1,e2;
+	//ktime_t sendt;
+	//unsigned short idx;
 	unsigned long		bi_flags;	/* status, command, etc */
 	unsigned long		bi_rw;		/* bottom bits READ/WRITE,
 						 * top bits priority

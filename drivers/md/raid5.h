@@ -4,7 +4,7 @@
 #include <linux/raid/xor.h>
 #include <linux/dmaengine.h>
 #include <linux/time.h>
-
+#include <linux/ktime.h>
 /*
  *
  * Each stripe contains one buffer per device.  Each buffer can be in
@@ -406,6 +406,10 @@ struct r5conf {
 	int         slow_disk; //MikeT: added
     int         *slow_cnt;
     int         bio_count;
+    ktime_t     sample_time;
+    int         *sector_read;
+    int         *sector_write;
+    int         *weighted_time;
 	/* reshape_progress is the leading edge of a 'reshape'
 	 * It has value MaxSector when no reshape is happening
 	 * If delta_disks < 0, it is the last sector we started work on,
@@ -496,6 +500,10 @@ struct r5conf {
 	 * the new thread here until we fully activate the array.
 	 */
 	struct md_thread	*thread;
+	struct md_thread    *clean_thread;
+	struct bio          *toclean;
+	struct bio          *clean_head, *clean_tail;
+	spinlock_t          clean_lock;
 	struct list_head	temp_inactive_list[NR_STRIPE_HASH_LOCKS];
 	struct r5worker_group	*worker_groups;
 	int			group_cnt;
@@ -570,4 +578,5 @@ extern sector_t raid5_compute_sector_MikeT(struct r5conf *conf, sector_t r_secto
                                            int previous, int *dd_idx, int *pd, int *qd, int *ddf);
 extern void raid5_compute_dnr_MikeT(struct r5conf *conf, int previous, int *dd_idx, int *pd, int *qd);
 extern void raid5_record_slow(struct r5conf *conf, int d_idx);
+extern void enqueue_clean_list(struct bio *bio, struct r5conf *conf);
 #endif
