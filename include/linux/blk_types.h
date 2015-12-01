@@ -137,6 +137,7 @@ struct bio {
 #define BIO_NEED_PARITY 12
 #define BIO_FREE_DATA 14
 #define BIO_DONT_SEND 15
+#define BIO_IN_COMPUTE 16
 
 /*
  * Flags starting here get preserved by bio_reset() - this includes
